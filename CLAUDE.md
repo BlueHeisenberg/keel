@@ -59,6 +59,11 @@ would have meant a data migration.
 - `sandbox` is Linux-only in behaviour but must **compile** on Windows and macOS;
   consumers gate construction on `runtime.GOOS`. Where a backend cannot work, return a
   typed error, never panic.
+- CI enforces all of that, so run it locally before pushing rather than discovering it
+  there: `gofmt -l .` empty, `go vet ./...`, `go build ./...`, `go test -race ./...` on
+  your own platform; `GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build ./...` and the
+  same for `darwin/arm64` to catch the cross-compile matrix; and `go mod tidy` leaving
+  `go.mod` and `go.sum` untouched, which is the dependency budget failing loudly.
 - Public API is not stable before `v1.0.0`, but breaking it still costs a consumer a
   day, so break it on purpose.
 - Package docs state plainly what a package does and does not defend against. The

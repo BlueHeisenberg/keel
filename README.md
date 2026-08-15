@@ -3,7 +3,7 @@
 **Domain-free Go mechanisms for self-hosted agent systems.**
 
 keel is the structural core shared by [kenward](https://github.com/BlueHeisenberg/kenward)
-and its ancestor [the-harness](https://github.com/BlueHeisenberg/the-harness): process
+and its ancestor the-harness, which is not public: process
 isolation, sealed secret storage, an OpenAI-compatible model client, and seamless
 self-update. It is deliberately small, deliberately boring, and deliberately knows
 nothing about whatever product is using it.
@@ -88,6 +88,26 @@ try.
 
 **`vault` — there is no DEK rotation.** `Rotate` changes the passphrase, not the data
 key. A leaked data key means re-sealing everything.
+
+## What CI checks
+
+Every push and pull request to `main` runs three jobs, and between them they enforce the
+two properties this module's callers depend on that a single-platform `go test` would
+not catch.
+
+**test** — on Linux, macOS and Windows: `gofmt -l` must come back empty, then `go vet`,
+`go build` and `go test -race`.
+
+**cross-compile** — `go build` and `go vet` for `linux/amd64`, `linux/arm64`,
+`darwin/amd64`, `darwin/arm64` and `windows/amd64`, with `CGO_ENABLED=0`. `sandbox` is
+Linux-only in *behaviour* but must **compile** everywhere, because consumers import it
+from cross-platform binaries and gate construction on `runtime.GOOS`. A build break there
+is invisible on Linux and fatal downstream, which is exactly the failure a matrix exists
+to find.
+
+**dependency budget** — `go mod tidy` must leave `go.mod` and `go.sum` unchanged, and the
+direct dependency list is printed on every build. A module imported into everything must
+not drag a tree behind it, and the way that rule dies is silently.
 
 ## Versions
 
