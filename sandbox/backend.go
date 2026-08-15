@@ -5,7 +5,9 @@ package sandbox
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"io/fs"
 )
 
 // SandboxLevel describes the isolation level of a sandbox.
@@ -100,6 +102,29 @@ type Spec struct {
 	// at creation time.
 	Env map[string]string
 
+	// Command overrides the arguments the image's entrypoint receives (in OCI
+	// terms it replaces the image's CMD; the ENTRYPOINT still runs).  Empty
+	// means the image decides, which is the behaviour before this field
+	// existed.
+	//
+	// Each element is delivered to the runtime as exactly one argv entry with
+	// no shell anywhere on the path: spaces, quotes, equals signs and non-ASCII
+	// text arrive byte-identical, and no element can split into two arguments.
+	//
+	// Supported by PodmanBackend.  QemuBackend rejects a non-empty Command with
+	// ErrSpecUnsupported: a VM runs whatever its disk image boots.
+	Command []string
+
+	// Files are provisioned into the sandbox filesystem at create time, before
+	// the workload's entrypoint starts, so the process never observes a moment
+	// in which an expected file is missing (WriteFile, by contrast, acts on a
+	// sandbox that is already running).  See File for path and mode rules.
+	//
+	// Supported by PodmanBackend.  QemuBackend rejects non-empty Files with
+	// ErrSpecUnsupported: its file transport is the in-guest bridge, which only
+	// exists once the VM has booted.
+	Files []File
+
 	// ServePort is the in-container TCP port that the workload's web server
 	// listens on (Profile=web only).  The backend picks a random host port
 	// and records it in Handle.Endpoints["web"].
@@ -126,6 +151,33 @@ type Spec struct {
 	// NetworkPolicy == NetworkPolicyFiltered; set before calling Create.
 	// Example: "127.0.0.1:7070"
 	EgressProxyAddr string
+}
+
+// File is one file provisioned into a sandbox at create time (Spec.Files).
+type File struct {
+	// Path is the absolute destination inside the sandbox, for example
+	// "/etc/app/config.yaml".  It must be absolute, already clean (no "." or
+	// ".." elements, no doubled or trailing slashes), and not "/" itself.
+	// Parent directories that do not exist are created by the copy (0755,
+	// root-owned); directories that already exist are left alone.
+	Path string
+
+	// Data is the file content.
+	Data []byte
+
+	// Mode is the file's permission bits inside the sandbox, and it is
+	// required: a zero Mode fails Create rather than silently choosing one,
+	// because the gap between 0600 and 0644 is the gap between a private
+	// credential and a world-readable one.  Only permission bits are allowed;
+	// file-type bits (fs.ModeDir and friends) are rejected.
+	Mode fs.FileMode
+
+	// UID and GID set the file's owner inside the sandbox, so a workload that
+	// runs as a non-root account can be handed a file only it can read.  The
+	// zero values mean uid 0 / gid 0 (root).  These are accounts in the guest,
+	// not on the host, and mean nothing outside the sandbox.
+	UID int
+	GID int
 }
 
 // Handle is the opaque reference returned after Create.  Callers must store
@@ -236,6 +288,10 @@ type Backend interface {
 
 	// WriteFile writes data to path inside the sandbox, creating parent
 	// directories as needed.  Equivalent to `podman exec -i sh -c 'cat > path'`.
+	//
+	// The sandbox is already running when WriteFile acts, so a file the
+	// workload needs at startup would arrive after the race is lost.  For
+	// those, use Spec.Files at Create, which lands before the entrypoint runs.
 	WriteFile(ctx context.Context, id string, path string, data []byte) error
 
 	// ReadFile reads the content of path from inside the sandbox.
@@ -280,6 +336,59 @@ type Backend interface {
 	ContainerAddr(ctx context.Context, id string, port int) (string, error)
 }
 
+// CommandError reports that a host tool this package shells out to (podman,
+// qemu-system, qemu-img) ran and exited non-zero.
+//
+// # What Error does not say
+//
+// Error renders only the tool, its subcommand, and the exit code — never the
+// tool's stderr. An error string is the one part of a failure that reaches a
+// log by default, and a tool's stderr is whatever the tool chose to print,
+// which can include fragments of its own invocation. Sandbox invocations carry
+// caller configuration, so rendering stderr by default would make every
+// consumer responsible for scrubbing it. The text is not lost, only unlisted:
+// read [CommandError.Detail] when deliberately debugging, at which point
+// disclosing it is a decision rather than an accident. (llm.APIError withholds
+// provider error bodies for the same reason; this is the same pattern.)
+type CommandError struct {
+	// Tool is the binary that ran, for example "podman".
+	Tool string
+
+	// Subcommand is the tool's first argument, for example "run". Empty when
+	// the tool was invoked without one.
+	Subcommand string
+
+	// ExitCode is the tool's exit status.
+	ExitCode int
+
+	// Stderr is the tool's standard error, trimmed. It is retained for
+	// Detail and never rendered by Error.
+	Stderr string
+
+	// Err is the underlying error, an *exec.ExitError, kept so errors.As
+	// still reaches it.
+	Err error
+}
+
+// Error implements error. It renders the tool, subcommand, and exit code —
+// never stderr. See the type documentation for why, and [CommandError.Detail]
+// for how to get the text.
+func (e *CommandError) Error() string {
+	if e.Subcommand == "" {
+		return fmt.Sprintf("%s: exit %d", e.Tool, e.ExitCode)
+	}
+	return fmt.Sprintf("%s %s: exit %d", e.Tool, e.Subcommand, e.ExitCode)
+}
+
+// Unwrap returns the underlying failure so errors.Is and errors.As reach it.
+func (e *CommandError) Unwrap() error { return e.Err }
+
+// Detail returns the tool's stderr. It is a method rather than part of Error
+// so that disclosing it is a decision: treat the result as potentially
+// sensitive diagnostics, and log it where such text is allowed to go, or not
+// at all.
+func (e *CommandError) Detail() string { return e.Stderr }
+
 // ErrPodmanUnavailable is returned when the podman binary cannot be found or
 // exits with a status that indicates it is not installed/configured.
 // Callers should check errors.Is(err, ErrPodmanUnavailable) and surface a
@@ -293,3 +402,10 @@ var ErrSandboxNotFound = errors.New("sandbox not found")
 // ErrWrongProfile is returned when DesktopEndpoint is called on a non-desktop
 // sandbox or WebEndpoint on a non-web sandbox.
 var ErrWrongProfile = errors.New("operation not supported for this sandbox profile")
+
+// ErrSpecUnsupported is returned by Create when a Spec asks for something the
+// chosen backend cannot deliver (for example Spec.Command or Spec.Files on the
+// QEMU backend).  Failing loudly is deliberate: silently ignoring a command
+// vector or a config file would hand the caller a sandbox that runs the wrong
+// thing, or runs without the file it was promised.
+var ErrSpecUnsupported = errors.New("spec field not supported by this backend")

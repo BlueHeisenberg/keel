@@ -901,3 +901,36 @@ func TestSnapshot_LabelSanitizedInCommandAndRef(t *testing.T) {
 		t.Errorf("expected savevm with sanitized tag %q, got %+v", wantTag, fq.conn.cmds)
 	}
 }
+
+// ---- Spec.Command / Spec.Files rejection -------------------------------------
+
+// TestQemuCreate_CommandAndFilesUnsupported verifies the QEMU backend fails
+// loudly on the two Spec fields it cannot deliver — a VM boots whatever its
+// disk image boots, and file transfer needs a booted guest — instead of
+// handing back a VM that silently ran the wrong thing or lacks a promised
+// file.  Nothing may be created: no runner call, no state dir.
+func TestQemuCreate_CommandAndFilesUnsupported(t *testing.T) {
+	cases := []struct {
+		name string
+		spec Spec
+	}{
+		{"command", Spec{Name: "vm-cmd", Command: []string{"kenward", "--member=x"}}},
+		{"files", Spec{Name: "vm-files", Files: []File{{Path: "/etc/x", Data: []byte("d"), Mode: 0o600}}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &mockRunner{}
+			b := newQemuTestBackend(t, r)
+			_, err := b.Create(context.Background(), tc.spec)
+			if !errors.Is(err, ErrSpecUnsupported) {
+				t.Fatalf("expected ErrSpecUnsupported, got %v", err)
+			}
+			if len(r.calls) != 0 {
+				t.Fatalf("expected zero runner calls, got %d: %v", len(r.calls), r.calls)
+			}
+			if _, serr := os.Stat(b.sandboxDir(tc.spec.Name)); serr == nil {
+				t.Error("state dir was created despite the rejected spec")
+			}
+		})
+	}
+}

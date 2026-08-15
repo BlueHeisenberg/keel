@@ -3,6 +3,7 @@
 package sandbox
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -12,9 +13,14 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"net"
+	"os"
 	"os/exec"
+	"path"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // effectivePolicy returns the policy to apply, treating the empty string as
@@ -34,19 +40,26 @@ var _ Backend = (*PodmanBackend)(nil)
 type runner interface {
 	// Run executes args as a command (args[0] is the program).
 	// stdin is written to the process's stdin if non-nil.
+	// extraEnv entries ("K=V") are appended to the process's inherited
+	// environment; nil means inherit unchanged.  This is how secret values
+	// reach a tool WITHOUT appearing on its argv, where any local user could
+	// read them out of the host's process list.
 	// Returns stdout, stderr, and any execution error.
 	// A non-zero exit code is surfaced as an *exec.ExitError inside err.
-	Run(ctx context.Context, args []string, stdin []byte) (stdout, stderr []byte, err error)
+	Run(ctx context.Context, args []string, stdin []byte, extraEnv []string) (stdout, stderr []byte, err error)
 }
 
 // execRunner is the production runner backed by os/exec.
 type execRunner struct{}
 
-func (execRunner) Run(ctx context.Context, args []string, stdin []byte) ([]byte, []byte, error) {
+func (execRunner) Run(ctx context.Context, args []string, stdin []byte, extraEnv []string) ([]byte, []byte, error) {
 	if len(args) == 0 {
 		return nil, nil, errors.New("runner: empty args")
 	}
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+	if len(extraEnv) > 0 {
+		cmd.Env = append(os.Environ(), extraEnv...)
+	}
 	if stdin != nil {
 		cmd.Stdin = bytes.NewReader(stdin)
 	}
@@ -138,21 +151,33 @@ func pickFreePort() (int, error) {
 
 // podman wraps the run method so callers don't repeat the binary name.
 func (b *PodmanBackend) podman(ctx context.Context, args []string, stdin []byte) ([]byte, []byte, error) {
+	return b.podmanEnv(ctx, args, stdin, nil)
+}
+
+// podmanEnv is podman with extra process environment for the tool (see
+// runner.Run).  Used where a value must reach podman without touching argv.
+func (b *PodmanBackend) podmanEnv(ctx context.Context, args []string, stdin []byte, extraEnv []string) ([]byte, []byte, error) {
 	full := append([]string{b.cfg.PodmanBinary}, args...)
-	stdout, stderr, err := b.r.Run(ctx, full, stdin)
+	stdout, stderr, err := b.r.Run(ctx, full, stdin, extraEnv)
 	if err != nil {
 		// Detect "not found" from exec.LookPath or PATH execution errors.
 		var execErr *exec.Error
 		if errors.As(err, &execErr) && execErr.Err == exec.ErrNotFound {
 			return nil, nil, fmt.Errorf("%w: %s", ErrPodmanUnavailable, execErr.Err)
 		}
-		// Exit error — wrap with %w to preserve the *exec.ExitError in the chain
-		// so that Exec() can unwrap it for the exit code, while still embedding
-		// stderr text for human-readable log/error messages.
+		// Exit error — return a CommandError that keeps the *exec.ExitError in
+		// the chain (Exec unwraps it for the exit code) and carries stderr in
+		// Detail rather than in the error string, so a log line cannot echo
+		// whatever the tool chose to print.
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
-			return stdout, stderr, fmt.Errorf("podman %s: exit %d: %s: %w",
-				args[0], exitErr.ExitCode(), strings.TrimSpace(string(stderr)), exitErr)
+			return stdout, stderr, &CommandError{
+				Tool:       "podman",
+				Subcommand: args[0],
+				ExitCode:   exitErr.ExitCode(),
+				Stderr:     strings.TrimSpace(string(stderr)),
+				Err:        exitErr,
+			}
 		}
 		return nil, nil, fmt.Errorf("podman %s: %w", args[0], err)
 	}
@@ -208,6 +233,16 @@ func (b *PodmanBackend) Create(ctx context.Context, spec Spec) (Handle, error) {
 		return Handle{}, err
 	}
 
+	// Validate the provisioned files and environment before anything is
+	// created, so a bad Files or Env entry cannot leave an orphaned volume or
+	// container behind.
+	if err := validFiles(spec.Files); err != nil {
+		return Handle{}, fmt.Errorf("sandbox create %s: %w", sandboxID, err)
+	}
+	if err := validEnv(spec.Env); err != nil {
+		return Handle{}, fmt.Errorf("sandbox create %s: %w", sandboxID, err)
+	}
+
 	// Resolve the image before creating anything, so a misconfigured backend
 	// does not leave an orphaned volume behind.
 	image := spec.Image
@@ -228,14 +263,23 @@ func (b *PodmanBackend) Create(ctx context.Context, spec Spec) (Handle, error) {
 
 	policy := effectivePolicy(spec.NetworkPolicy)
 
-	// Build `podman run` arguments.
-	args := []string{
-		"run", "-d",
-		"--name", cname,
-		"--label", b.cfg.LabelKey + "=" + spec.Name,
-		"--volume", vol + ":/work",
-		"--env", "PROFILE=" + string(spec.Profile),
+	// When files must be provisioned they have to land BEFORE the workload's
+	// entrypoint starts, so the container is created stopped (`podman create`),
+	// the files are copied in, and only then is it started.  With no files,
+	// `podman run -d` is used exactly as before.
+	provision := len(spec.Files) > 0
+
+	// Build the `podman run`/`podman create` arguments.
+	args := []string{"run", "-d"}
+	if provision {
+		args = []string{"create"}
 	}
+	args = append(args,
+		"--name", cname,
+		"--label", b.cfg.LabelKey+"="+spec.Name,
+		"--volume", vol+":/work",
+		"--env", "PROFILE="+string(spec.Profile),
+	)
 
 	// ── Egress policy ────────────────────────────────────────────────────────
 	//
@@ -289,18 +333,31 @@ func (b *PodmanBackend) Create(ctx context.Context, spec Spec) (Handle, error) {
 		args = append(args, "--memory", fmt.Sprintf("%dm", spec.MemoryMB))
 	}
 
-	// Extra environment variables.
-	for k, v := range spec.Env {
-		args = append(args, "--env", k+"="+v)
-	}
+	// Extra environment variables.  The VALUES are deliberately kept off the
+	// argv: `--env K=V` would render V in the host's process list, where any
+	// local user can read it via ps while podman runs, and callers put
+	// credentials in Env.  Instead each variable is passed as `--env K` — a
+	// form podman resolves from its own process environment — and the value
+	// travels through that environment (runner extraEnv), which the kernel
+	// exposes only to the same user and root.  Only the NAME appears on the
+	// argv.  The variables this package composes itself (PROFILE, the proxy
+	// vars above) stay in K=V form: they are non-secret by construction.
+	envArgs, extraEnv := splitEnv(spec.Env)
+	args = append(args, envArgs...)
 
 	// Port mapping — bind to loopback only.
 	if containerPort > 0 {
 		args = append(args, "--publish", fmt.Sprintf("127.0.0.1:%d:%d", hostPort, containerPort))
 	}
 
-	// Image must be last.
+	// Image ends podman's own flag parsing; everything after it is the
+	// container command.  Spec.Command therefore goes AFTER the image, each
+	// element as one argv entry.  No shell sits anywhere on this path — the
+	// runner passes an argv slice to podman, and podman hands it to the OCI
+	// runtime as the process args — so an element containing spaces, quotes,
+	// or equals signs arrives intact and cannot become a second argument.
 	args = append(args, image)
+	args = append(args, spec.Command...)
 
 	b.log.Debug("sandbox: creating container",
 		"sandbox", spec.Name,
@@ -308,13 +365,36 @@ func (b *PodmanBackend) Create(ctx context.Context, spec Spec) (Handle, error) {
 		"image", image,
 	)
 
-	stdout, _, err := b.podman(ctx, args, nil)
+	stdout, _, err := b.podmanEnv(ctx, args, nil, extraEnv)
 	if err != nil {
 		return Handle{}, fmt.Errorf("sandbox create container: %w", err)
 	}
 
 	// stdout is the full container ID (64-hex chars + newline).
 	containerID := strings.TrimSpace(string(stdout))
+
+	// ── File provisioning (create-time) ──────────────────────────────────────
+	// The container exists but has not started, so the files land before the
+	// entrypoint can look for them.  Fail-closed on any error: destroy the
+	// container rather than leave one running without the files it was
+	// promised.
+	if provision {
+		if err := b.copyFilesIn(ctx, sandboxID, spec.Files); err != nil {
+			if derr := b.Destroy(ctx, sandboxID); derr != nil {
+				b.log.Warn("sandbox: file provisioning failed and cleanup also failed",
+					"sandbox", spec.Name, "provision_err", err, "cleanup_err", derr)
+			}
+			return Handle{}, fmt.Errorf("sandbox create: provision files: %w", err)
+		}
+		if _, _, err := b.podman(ctx, []string{"start", cname}, nil); err != nil {
+			if derr := b.Destroy(ctx, sandboxID); derr != nil {
+				b.log.Warn("sandbox: start after provisioning failed and cleanup also failed",
+					"sandbox", spec.Name, "start_err", err, "cleanup_err", derr)
+			}
+			return Handle{}, fmt.Errorf("sandbox create: start after provisioning: %w", err)
+		}
+	}
+	// ── end file provisioning ────────────────────────────────────────────────
 
 	// ── Host-applied egress lockdown (H3/H4) ─────────────────────────────────
 	// For internal-only/filtered, apply the nftables ruleset from the HOST into
@@ -395,7 +475,7 @@ func (b *PodmanBackend) applyHostEgress(ctx context.Context, sandboxID, containe
 	// Apply the ruleset from the host into the container netns.
 	// nsenter -t <pid> -n nft -f -   (ruleset piped on stdin)
 	nsArgs := []string{"nsenter", "-t", pid, "-n", "nft", "-f", "-"}
-	if _, stderr, err := b.r.Run(ctx, nsArgs, []byte(ruleset)); err != nil {
+	if _, stderr, err := b.r.Run(ctx, nsArgs, []byte(ruleset), nil); err != nil {
 		return fmt.Errorf("%w: nsenter nft load: %v: %s", ErrEgressUnavailable, err, strings.TrimSpace(string(stderr)))
 	}
 
@@ -406,7 +486,7 @@ func (b *PodmanBackend) applyHostEgress(ctx context.Context, sandboxID, containe
 		// Fall back to checking from the host netns in case the container image
 		// lacks the nft binary; the host check is authoritative.
 		hostCheck := []string{"nsenter", "-t", pid, "-n", "nft", "list", "table", "ip", b.cfg.EgressTable}
-		if _, _, herr := b.r.Run(ctx, hostCheck, nil); herr != nil {
+		if _, _, herr := b.r.Run(ctx, hostCheck, nil, nil); herr != nil {
 			return fmt.Errorf("%w: egress table not present after load (container: %v; host: %v)",
 				ErrEgressUnavailable, err, herr)
 		}
@@ -572,8 +652,11 @@ func (b *PodmanBackend) Exec(ctx context.Context, id string, cmd []string, opts 
 	if err := validID(id); err != nil {
 		return ExecResult{}, err
 	}
-	args := b.buildExecArgs(id, cmd, opts)
-	stdout, stderr, err := b.podman(ctx, args, nil)
+	args, extraEnv, err := b.buildExecArgs(id, cmd, opts)
+	if err != nil {
+		return ExecResult{}, fmt.Errorf("sandbox exec %s: %w", id, err)
+	}
+	stdout, stderr, err := b.podmanEnv(ctx, args, nil, extraEnv)
 
 	// Collect exit code from ExitError; a non-zero exit is not a Go error —
 	// the caller reads ExitResult.ExitCode.
@@ -603,10 +686,16 @@ func (b *PodmanBackend) ExecStream(ctx context.Context, id string, cmd []string,
 	if err := validID(id); err != nil {
 		return nil, err
 	}
-	argSlice := b.buildExecArgs(id, cmd, opts)
+	argSlice, extraEnv, err := b.buildExecArgs(id, cmd, opts)
+	if err != nil {
+		return nil, fmt.Errorf("sandbox exec-stream %s: %w", id, err)
+	}
 	// prepend the binary name
 	full := append([]string{b.cfg.PodmanBinary}, argSlice...)
 	osCmd := exec.CommandContext(ctx, full[0], full[1:]...)
+	if len(extraEnv) > 0 {
+		osCmd.Env = append(os.Environ(), extraEnv...)
+	}
 
 	pr, err := osCmd.StdoutPipe()
 	if err != nil {
@@ -645,21 +734,67 @@ func (s *streamCloser) Close() error {
 }
 
 // buildExecArgs constructs the `exec` subcommand arguments (without the binary
-// prefix) for both Exec and ExecStream.
-func (b *PodmanBackend) buildExecArgs(id string, cmd []string, opts ExecOpts) []string {
-	args := []string{"exec"}
+// prefix) for both Exec and ExecStream.  Environment values are returned
+// separately as extraEnv rather than placed on the argv — see splitEnv.
+func (b *PodmanBackend) buildExecArgs(id string, cmd []string, opts ExecOpts) (args, extraEnv []string, err error) {
+	if err := validEnv(opts.Env); err != nil {
+		return nil, nil, err
+	}
+	args = []string{"exec"}
 	if opts.WorkDir != "" {
 		args = append(args, "--workdir", opts.WorkDir)
 	}
 	if opts.RunAs != "" {
 		args = append(args, "--user", opts.RunAs)
 	}
-	for k, v := range opts.Env {
-		args = append(args, "--env", k+"="+v)
-	}
+	envArgs, extraEnv := splitEnv(opts.Env)
+	args = append(args, envArgs...)
 	args = append(args, b.containerName(id))
 	args = append(args, cmd...)
-	return args
+	return args, extraEnv, nil
+}
+
+// envKeyRe is the allowed shape of an environment variable name.  Restricting
+// to the POSIX portable set is load-bearing: podman expands `--env K*` as a
+// glob importing every matching variable from its own environment, and '='
+// or NUL would corrupt the K=V entry handed to the kernel.
+var envKeyRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// validEnv rejects environment maps whose keys could act as podman globs or
+// break the K=V form, and values that cannot cross an execve boundary.
+func validEnv(env map[string]string) error {
+	for k, v := range env {
+		if !envKeyRe.MatchString(k) {
+			return fmt.Errorf("env %q: name must match [A-Za-z_][A-Za-z0-9_]*", k)
+		}
+		if strings.ContainsRune(v, 0) {
+			return fmt.Errorf("env %q: value contains NUL", k)
+		}
+	}
+	return nil
+}
+
+// splitEnv turns an environment map into the argv fragment and the process
+// environment that together deliver it to the container: `--env K` on the argv
+// (name only — podman resolves the value from its own environment) and "K=V"
+// in extraEnv for the runner to place in that environment.  Keeping values off
+// the argv keeps them out of the host's process list, which any local user can
+// read; a process's environment is readable only by its own user and root.
+// Keys are sorted so the argv is deterministic.
+func splitEnv(env map[string]string) (envArgs, extraEnv []string) {
+	if len(env) == 0 {
+		return nil, nil
+	}
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		envArgs = append(envArgs, "--env", k)
+		extraEnv = append(extraEnv, k+"="+env[k])
+	}
+	return envArgs, extraEnv
 }
 
 // WriteFile implements Backend.WriteFile.
@@ -703,6 +838,20 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
+// errText returns the searchable text of err for classification: the error
+// string, plus the withheld stderr when a CommandError is in the chain.
+// Classifiers must use this rather than err.Error(), because CommandError
+// deliberately keeps the tool's stderr — where podman says "no such
+// container" — out of the error string.
+func errText(err error) string {
+	text := err.Error()
+	var ce *CommandError
+	if errors.As(err, &ce) {
+		text += " " + ce.Stderr
+	}
+	return strings.ToLower(text)
+}
+
 // isNotFoundErr reports whether err (from a podman rm / volume rm / rmi call)
 // indicates the target container, volume, or image simply does not exist.
 // Such "not found" failures are tolerated during best-effort cleanup so a
@@ -711,13 +860,107 @@ func isNotFoundErr(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := strings.ToLower(err.Error())
+	msg := errText(err)
 	return strings.Contains(msg, "no such container") ||
 		strings.Contains(msg, "no container with name") ||
 		strings.Contains(msg, "no such volume") ||
 		strings.Contains(msg, "no volume with name") ||
 		strings.Contains(msg, "no such image") ||
 		strings.Contains(msg, "image not known")
+}
+
+// isNoSuchContainer reports whether err indicates the container does not
+// exist, for mapping to ErrSandboxNotFound.
+func isNoSuchContainer(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := errText(err)
+	return strings.Contains(msg, "no such container") ||
+		strings.Contains(msg, "no container with name or id")
+}
+
+// ---- create-time file provisioning ------------------------------------------
+
+// validFiles rejects Spec.Files entries whose path could escape or alias
+// (relative, unclean, or the root itself), whose mode is missing or carries
+// file-type bits, or whose ownership is negative.  Duplicated paths are
+// rejected rather than letting the last write win silently.
+func validFiles(files []File) error {
+	seen := make(map[string]bool, len(files))
+	for _, f := range files {
+		if !strings.HasPrefix(f.Path, "/") {
+			return fmt.Errorf("file %q: path must be absolute", f.Path)
+		}
+		if f.Path == "/" || path.Clean(f.Path) != f.Path {
+			return fmt.Errorf("file %q: path must be a clean absolute file path (no \".\", \"..\", doubled or trailing slashes)", f.Path)
+		}
+		if seen[f.Path] {
+			return fmt.Errorf("file %q: duplicate path", f.Path)
+		}
+		seen[f.Path] = true
+		if f.Mode == 0 {
+			return fmt.Errorf("file %q: explicit mode bits are required (for example 0o600); refusing to choose one silently", f.Path)
+		}
+		if f.Mode != f.Mode.Perm() {
+			return fmt.Errorf("file %q: mode %v carries file-type bits; only permission bits are allowed", f.Path, f.Mode)
+		}
+		if f.UID < 0 || f.GID < 0 {
+			return fmt.Errorf("file %q: negative uid/gid", f.Path)
+		}
+	}
+	return nil
+}
+
+// copyFilesIn lands Spec.Files in the (created, not yet started) container via
+// `podman cp --archive=false - <ctr>:/` with a tar stream on stdin.  Copy-in
+// rather than a mount keeps the sandbox self-contained: nothing on the host
+// filesystem has to exist, persist, or stay in sync for the sandbox to run.
+// --archive=false makes podman preserve the ownership recorded in the tar
+// headers (File.UID/GID) instead of chowning to the container's primary user.
+func (b *PodmanBackend) copyFilesIn(ctx context.Context, id string, files []File) error {
+	archive, err := filesArchive(files)
+	if err != nil {
+		return err
+	}
+	cpArgs := []string{"cp", "--archive=false", "-", b.containerName(id) + ":/"}
+	if _, _, err := b.podman(ctx, cpArgs, archive); err != nil {
+		return fmt.Errorf("copy files in: %w", err)
+	}
+	return nil
+}
+
+// filesArchive builds the tar stream podman extracts at the container root.
+// Each entry carries the exact mode and ownership from its File.  Parent
+// directories are not emitted as entries: the extraction creates missing ones
+// itself (0755, root-owned) and — unlike an explicit directory entry — leaves
+// the permissions of directories that already exist untouched.  Timestamps are
+// pinned to the epoch so the archive is deterministic.
+func filesArchive(files []File) ([]byte, error) {
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	epoch := time.Unix(0, 0)
+	for _, f := range files {
+		hdr := &tar.Header{
+			Typeflag: tar.TypeReg,
+			Name:     strings.TrimPrefix(f.Path, "/"),
+			Mode:     int64(f.Mode.Perm()),
+			Uid:      f.UID,
+			Gid:      f.GID,
+			Size:     int64(len(f.Data)),
+			ModTime:  epoch,
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			return nil, fmt.Errorf("tar %q: %w", f.Path, err)
+		}
+		if _, err := tw.Write(f.Data); err != nil {
+			return nil, fmt.Errorf("tar %q: %w", f.Path, err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		return nil, fmt.Errorf("tar close: %w", err)
+	}
+	return buf.Bytes(), nil
 }
 
 // Snapshot implements Backend.Snapshot.
@@ -834,8 +1077,7 @@ func (b *PodmanBackend) Inspect(ctx context.Context, id string) (Status, error) 
 	stdout, _, err := b.podman(ctx, []string{"inspect", "--format", "json", b.containerName(id)}, nil)
 	if err != nil {
 		// If the container doesn't exist, surface ErrSandboxNotFound.
-		if strings.Contains(err.Error(), "no such container") ||
-			strings.Contains(err.Error(), "no container with name or id") {
+		if isNoSuchContainer(err) {
 			return Status{}, fmt.Errorf("sandbox inspect %s: %w", id, ErrSandboxNotFound)
 		}
 		return Status{}, fmt.Errorf("sandbox inspect %s: %w", id, err)
@@ -927,8 +1169,7 @@ func (b *PodmanBackend) ContainerAddr(ctx context.Context, id string, port int) 
 	}
 	stdout, _, err := b.podman(ctx, []string{"inspect", "--format", "{{.NetworkSettings.IPAddress}}", b.containerName(id)}, nil)
 	if err != nil {
-		if strings.Contains(err.Error(), "no such container") ||
-			strings.Contains(err.Error(), "no container with name or id") {
+		if isNoSuchContainer(err) {
 			return "", fmt.Errorf("sandbox container addr %s: %w", id, ErrSandboxNotFound)
 		}
 		return "", fmt.Errorf("sandbox container addr %s: %w", id, err)

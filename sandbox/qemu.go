@@ -320,16 +320,28 @@ func (b *QemuBackend) pidfilePath(id string) string {
 
 // run wraps the runner, mapping a missing qemu binary to ErrQemuUnavailable.
 func (b *QemuBackend) run(ctx context.Context, args []string, stdin []byte) ([]byte, []byte, error) {
-	stdout, stderr, err := b.r.Run(ctx, args, stdin)
+	stdout, stderr, err := b.r.Run(ctx, args, stdin, nil)
 	if err != nil {
 		var execErr *exec.Error
 		if errors.As(err, &execErr) && execErr.Err == exec.ErrNotFound {
 			return nil, nil, fmt.Errorf("%w: %v", ErrQemuUnavailable, execErr.Err)
 		}
+		// Exit error — return a CommandError that keeps the *exec.ExitError in
+		// the chain and carries stderr in Detail rather than in the error
+		// string; see CommandError for why stderr is withheld from logs.
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
-			return stdout, stderr, fmt.Errorf("qemu %s: exit %d: %s: %w",
-				args[0], exitErr.ExitCode(), strings.TrimSpace(string(stderr)), exitErr)
+			sub := ""
+			if len(args) > 1 {
+				sub = args[1]
+			}
+			return stdout, stderr, &CommandError{
+				Tool:       args[0],
+				Subcommand: sub,
+				ExitCode:   exitErr.ExitCode(),
+				Stderr:     strings.TrimSpace(string(stderr)),
+				Err:        exitErr,
+			}
 		}
 		return stdout, stderr, fmt.Errorf("qemu %s: %w", args[0], err)
 	}
@@ -350,6 +362,17 @@ func (b *QemuBackend) Create(ctx context.Context, spec Spec) (Handle, error) {
 	id := spec.Name
 	if err := validID(id); err != nil {
 		return Handle{}, err
+	}
+
+	// A VM runs whatever its disk image boots, and file transfer needs the
+	// in-guest bridge, which only exists after boot.  Both are the opposite of
+	// what these fields promise, so fail loudly rather than hand back a VM
+	// that silently ran the wrong thing or lacks a file it was promised.
+	if len(spec.Command) > 0 {
+		return Handle{}, fmt.Errorf("qemu create %s: Spec.Command: %w", id, ErrSpecUnsupported)
+	}
+	if len(spec.Files) > 0 {
+		return Handle{}, fmt.Errorf("qemu create %s: Spec.Files: %w", id, ErrSpecUnsupported)
 	}
 
 	// Resolve the base image to an absolute path so qemu-img records an absolute
@@ -959,7 +982,7 @@ func isQemuSnapshotMissing(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := strings.ToLower(err.Error())
+	msg := errText(err)
 	return strings.Contains(msg, "can't find snapshot") ||
 		strings.Contains(msg, "snapshot not found") ||
 		strings.Contains(msg, "no such snapshot") ||

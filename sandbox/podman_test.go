@@ -3,11 +3,16 @@
 package sandbox
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"log/slog"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 )
@@ -18,6 +23,7 @@ import (
 type call struct {
 	args  []string
 	stdin []byte
+	env   []string
 }
 
 // mockRunner implements runner for tests.  Each Test configures .responses in
@@ -33,8 +39,8 @@ type mockResponse struct {
 	err    error
 }
 
-func (m *mockRunner) Run(_ context.Context, args []string, stdin []byte) ([]byte, []byte, error) {
-	m.calls = append(m.calls, call{args: args, stdin: stdin})
+func (m *mockRunner) Run(_ context.Context, args []string, stdin []byte, extraEnv []string) ([]byte, []byte, error) {
+	m.calls = append(m.calls, call{args: args, stdin: stdin, env: extraEnv})
 	if len(m.responses) == 0 {
 		return nil, nil, nil
 	}
@@ -321,18 +327,25 @@ func TestCreate_NoLimitsWhenZero(t *testing.T) {
 	}
 }
 
+// TestCreate_ExtraEnv verifies the delivery contract for Spec.Env: the argv
+// carries only the variable NAME (`--env FOO`), the value travels through the
+// tool's process environment, and the value never appears in any argv element.
+// The value never appearing on the argv is the assertion that keeps a caller's
+// credential out of the host's process list, where any local user could read
+// it via ps while podman runs.
 func TestCreate_ExtraEnv(t *testing.T) {
 	r := &mockRunner{}
 	b := newTestBackend(r)
 
 	r.responses = []mockResponse{ok(""), ok("cid\n")}
 
+	const secret = "123456:AAsekret-bot-token-value"
 	spec := Spec{
 		Name:          "sb-env-1",
 		NetworkPolicy: NetworkPolicyOpen,
 		Image:         "test/desktop:latest",
 		Profile:       ProfileHeadless,
-		Env:           map[string]string{"FOO": "bar"},
+		Env:           map[string]string{"FOO": "bar", "BOT_TOKEN": secret},
 	}
 
 	if _, err := b.Create(context.Background(), spec); err != nil {
@@ -340,17 +353,65 @@ func TestCreate_ExtraEnv(t *testing.T) {
 	}
 
 	rc := r.calls[1]
-	// There should be an --env FOO=bar somewhere in the args.
-	found := false
-	for i, a := range rc.args {
-		if a == "--env" && i+1 < len(rc.args) && rc.args[i+1] == "FOO=bar" {
-			found = true
-			break
+	// Name-only flags on the argv, sorted for determinism.
+	if !hasFlagPair(rc.args, "--env", "FOO") || !hasFlagPair(rc.args, "--env", "BOT_TOKEN") {
+		t.Errorf("missing name-only --env flags in run args: %s", argString(rc.args))
+	}
+	// The values must NOT appear in any argv element.
+	for _, a := range rc.args {
+		if strings.Contains(a, secret) || strings.Contains(a, "FOO=bar") {
+			t.Errorf("env value leaked onto argv element %q (world-readable via ps)", a)
 		}
 	}
-	if !found {
-		t.Errorf("missing --env FOO=bar in run args: %s", argString(rc.args))
+	// The values travel through the process environment instead.
+	if !containsString(rc.env, "BOT_TOKEN="+secret) || !containsString(rc.env, "FOO=bar") {
+		t.Errorf("runner extraEnv missing values, got %q", rc.env)
 	}
+}
+
+// TestCreate_EnvInvalidKey verifies keys that could act as podman globs
+// (`--env K*` imports host variables) or corrupt the K=V form are rejected
+// before anything is created.
+func TestCreate_EnvInvalidKey(t *testing.T) {
+	for _, key := range []string{"", "A=B", "A B", "A*", "A\nB", "1ABC", "A-B"} {
+		t.Run(fmt.Sprintf("key=%q", key), func(t *testing.T) {
+			r := &mockRunner{}
+			b := newTestBackend(r)
+			spec := Spec{
+				Name:          "sb-env-bad",
+				NetworkPolicy: NetworkPolicyOpen,
+				Image:         "test/desktop:latest",
+				Profile:       ProfileHeadless,
+				Env:           map[string]string{key: "v"},
+			}
+			if _, err := b.Create(context.Background(), spec); err == nil {
+				t.Fatalf("expected error for env key %q", key)
+			}
+			if len(r.calls) != 0 {
+				t.Fatalf("expected zero runner calls for bad env key, got %d", len(r.calls))
+			}
+		})
+	}
+}
+
+// containsString reports whether ss contains s.
+func containsString(ss []string, s string) bool {
+	for _, x := range ss {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
+// hasFlagPair reports whether args contains flag immediately followed by value.
+func hasFlagPair(args []string, flag, value string) bool {
+	for i, a := range args {
+		if a == flag && i+1 < len(args) && args[i+1] == value {
+			return true
+		}
+	}
+	return false
 }
 
 // ---- Exec tests ------------------------------------------------------------
@@ -399,6 +460,9 @@ func TestExec_ArgVector(t *testing.T) {
 	}
 }
 
+// TestExec_EnvArgs verifies ExecOpts.Env follows the same delivery contract as
+// Spec.Env: name-only `--env` on the argv, value through the process
+// environment, value never on the argv.
 func TestExec_EnvArgs(t *testing.T) {
 	r := &mockRunner{}
 	b := newTestBackend(r)
@@ -413,15 +477,16 @@ func TestExec_EnvArgs(t *testing.T) {
 	}
 
 	c := r.calls[0]
-	found := false
-	for i, a := range c.args {
-		if a == "--env" && i+1 < len(c.args) && c.args[i+1] == "MY_VAR=testval" {
-			found = true
-			break
+	if !hasFlagPair(c.args, "--env", "MY_VAR") {
+		t.Errorf("missing name-only --env MY_VAR in exec args: %s", argString(c.args))
+	}
+	for _, a := range c.args {
+		if strings.Contains(a, "testval") {
+			t.Errorf("env value leaked onto exec argv element %q", a)
 		}
 	}
-	if !found {
-		t.Errorf("missing --env MY_VAR=testval in exec args: %s", argString(c.args))
+	if !containsString(c.env, "MY_VAR=testval") {
+		t.Errorf("runner extraEnv missing MY_VAR=testval, got %q", c.env)
 	}
 }
 
@@ -1075,5 +1140,446 @@ func TestPodman_AcceptsValidID(t *testing.T) {
 	}
 	if len(r.calls) == 0 {
 		t.Fatal("expected Start to shell out for a valid id")
+	}
+}
+
+// ---- Spec.Command tests ------------------------------------------------------
+
+// TestCreate_CommandVector_ExactArgv is the round-trip guarantee for
+// Spec.Command: every element must arrive as exactly one argv entry after the
+// image, byte-identical — spaces, quotes, equals signs and unicode included —
+// because there is no shell anywhere on the path to reinterpret them.
+func TestCreate_CommandVector_ExactArgv(t *testing.T) {
+	r := &mockRunner{}
+	b := newTestBackend(r)
+	r.responses = []mockResponse{ok(""), ok("cid\n")}
+
+	command := []string{
+		"kenward",
+		"--member=david",
+		"--config=/etc/kenward/kenward.yaml",
+		`--notes=a b "c"`,
+		"--unicode=héllo 世界 — ñ",
+		"--tricky=x; rm -rf / && echo $(pwned) | `backtick` 'quoted'",
+	}
+	spec := Spec{
+		Name:          "sb-cmd-1",
+		NetworkPolicy: NetworkPolicyOpen,
+		Image:         "test/img:latest",
+		Profile:       ProfileHeadless,
+		Command:       command,
+	}
+	if _, err := b.Create(context.Background(), spec); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	rc := r.calls[1]
+	imgIdx := findArg(rc.args, "test/img:latest")
+	if imgIdx < 0 {
+		t.Fatalf("image not found in run args: %s", argString(rc.args))
+	}
+	got := rc.args[imgIdx+1:]
+	if len(got) != len(command) {
+		t.Fatalf("argv after image has %d elements, want %d: %q", len(got), len(command), got)
+	}
+	for i := range command {
+		if got[i] != command[i] {
+			t.Errorf("argv[%d] = %q, want %q (must arrive byte-identical)", i, got[i], command[i])
+		}
+	}
+}
+
+// TestCreate_CommandVector_NoInjection asserts that a crafted argument cannot
+// become a second flag: an element that CONTAINS flag-looking text stays one
+// element, and none of its fragments appear as standalone argv entries.
+func TestCreate_CommandVector_NoInjection(t *testing.T) {
+	r := &mockRunner{}
+	b := newTestBackend(r)
+	r.responses = []mockResponse{ok(""), ok("cid\n")}
+
+	command := []string{
+		`--notes=a b "c"`,
+		"--looks-like-two=--evil --evil2",
+	}
+	spec := Spec{
+		Name:          "sb-cmd-2",
+		NetworkPolicy: NetworkPolicyOpen,
+		Image:         "test/img:latest",
+		Profile:       ProfileHeadless,
+		Command:       command,
+	}
+	if _, err := b.Create(context.Background(), spec); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	rc := r.calls[1]
+	imgIdx := findArg(rc.args, "test/img:latest")
+	if got := len(rc.args[imgIdx+1:]); got != 2 {
+		t.Fatalf("argv after image has %d elements, want exactly 2: %q", got, rc.args[imgIdx+1:])
+	}
+	// No fragment of either element may surface as its own argv entry,
+	// anywhere in the vector (before the image would be a podman flag).
+	for _, fragment := range []string{"--evil", "--evil2", "a", "b", `"c"`, "--notes=a"} {
+		if containsArg(rc.args, fragment) {
+			t.Errorf("fragment %q became a standalone argv element: %s", fragment, argString(rc.args))
+		}
+	}
+}
+
+// TestCreate_NoCommand_ImageLast pins today's behaviour for an empty Command:
+// the image stays the final argument and the image's own CMD decides.
+func TestCreate_NoCommand_ImageLast(t *testing.T) {
+	r := &mockRunner{}
+	b := newTestBackend(r)
+	r.responses = []mockResponse{ok(""), ok("cid\n")}
+
+	spec := Spec{
+		Name:          "sb-cmd-3",
+		NetworkPolicy: NetworkPolicyOpen,
+		Image:         "test/img:latest",
+		Profile:       ProfileHeadless,
+	}
+	if _, err := b.Create(context.Background(), spec); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	rc := r.calls[1]
+	if rc.args[len(rc.args)-1] != "test/img:latest" {
+		t.Errorf("with empty Command the image must be last, got %q", rc.args[len(rc.args)-1])
+	}
+}
+
+// ---- Spec.Files tests ---------------------------------------------------------
+
+// TestCreate_Files_CreateCpStart verifies the provisioning sequence: the
+// container is created stopped, the files are copied in as a tar stream with
+// exact mode and ownership, and only then is it started — so the entrypoint
+// can never observe a missing file.
+func TestCreate_Files_CreateCpStart(t *testing.T) {
+	r := &mockRunner{}
+	b := newTestBackend(r)
+	r.responses = []mockResponse{
+		ok(""),      // volume create
+		ok("cid\n"), // podman create
+		ok(""),      // podman cp
+		ok(""),      // podman start
+	}
+
+	secret := []byte("telegram:\n  bot_token: \"123456:AAsekret\"\n")
+	spec := Spec{
+		Name:          "sb-files-1",
+		NetworkPolicy: NetworkPolicyOpen,
+		Image:         "test/img:latest",
+		Profile:       ProfileHeadless,
+		Command:       []string{"--config=/etc/app/config.yaml"},
+		Files: []File{
+			{Path: "/etc/app/config.yaml", Data: secret, Mode: 0o600, UID: 1000, GID: 1000},
+			{Path: "/var/lib/app/seed", Data: []byte("s"), Mode: 0o644},
+		},
+	}
+	h, err := b.Create(context.Background(), spec)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if h.ContainerID != "cid" {
+		t.Errorf("Handle.ContainerID = %q, want %q", h.ContainerID, "cid")
+	}
+	if len(r.calls) != 4 {
+		t.Fatalf("expected 4 calls (volume, create, cp, start), got %d: %v", len(r.calls), r.calls)
+	}
+
+	// call[1] must be `podman create`, NOT `run -d`: the workload must not be
+	// running while its files are still missing.
+	cc := r.calls[1]
+	if cc.args[1] != "create" {
+		t.Fatalf("call[1] args[1] = %q, want 'create'", cc.args[1])
+	}
+	if containsArg(cc.args, "-d") {
+		t.Errorf("create call must not carry -d: %s", argString(cc.args))
+	}
+	// Command still rides after the image on the create call.
+	imgIdx := findArg(cc.args, "test/img:latest")
+	if imgIdx < 0 || imgIdx+1 >= len(cc.args) || cc.args[imgIdx+1] != "--config=/etc/app/config.yaml" {
+		t.Errorf("command vector missing after image in create call: %s", argString(cc.args))
+	}
+
+	// call[2] is the copy-in: tar on stdin, ownership preserved.
+	cp := r.calls[2]
+	if cp.args[1] != "cp" {
+		t.Fatalf("call[2] args[1] = %q, want 'cp'", cp.args[1])
+	}
+	if !containsArg(cp.args, "--archive=false") {
+		t.Errorf("cp must pass --archive=false so tar ownership is preserved: %s", argString(cp.args))
+	}
+	if !containsArg(cp.args, "-") || !containsArg(cp.args, b.containerName("sb-files-1")+":/") {
+		t.Errorf("cp must read tar from stdin into the container root: %s", argString(cp.args))
+	}
+
+	// The tar stream must carry exact paths, contents, modes, and ownership.
+	tr := tar.NewReader(bytes.NewReader(cp.stdin))
+	entries := map[string]*tar.Header{}
+	contents := map[string][]byte{}
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("reading provisioning tar: %v", err)
+		}
+		data, _ := io.ReadAll(tr)
+		entries[hdr.Name] = hdr
+		contents[hdr.Name] = data
+	}
+	cfg, ok := entries["etc/app/config.yaml"]
+	if !ok {
+		t.Fatalf("tar missing etc/app/config.yaml; entries: %v", entries)
+	}
+	if cfg.Mode != 0o600 {
+		t.Errorf("config mode = %o, want 600 — a bot token must not land world-readable", cfg.Mode)
+	}
+	if cfg.Uid != 1000 || cfg.Gid != 1000 {
+		t.Errorf("config uid:gid = %d:%d, want 1000:1000", cfg.Uid, cfg.Gid)
+	}
+	if !bytes.Equal(contents["etc/app/config.yaml"], secret) {
+		t.Errorf("config content mismatch: got %q", contents["etc/app/config.yaml"])
+	}
+	if seed, ok := entries["var/lib/app/seed"]; !ok || seed.Mode != 0o644 {
+		t.Errorf("seed entry missing or wrong mode: %+v", seed)
+	}
+
+	// call[3] starts the now-provisioned container.
+	st := r.calls[3]
+	if st.args[1] != "start" || !containsArg(st.args, b.containerName("sb-files-1")) {
+		t.Errorf("call[3] must be 'start <container>': %s", argString(st.args))
+	}
+}
+
+// TestCreate_Files_EgressAfterStart verifies ordering with an egress policy:
+// create → cp → start → host-applied lockdown, still fail-closed.
+func TestCreate_Files_EgressAfterStart(t *testing.T) {
+	r := &mockRunner{}
+	b := newTestBackend(r)
+	b.lookPath = fakeLookPath("nft", "nsenter")
+	r.responses = []mockResponse{
+		ok(""),            // volume create
+		ok("cid\n"),       // create
+		ok(""),            // cp
+		ok(""),            // start
+		ok("12345\n"),     // inspect pid
+		ok("10.88.0.1\n"), // inspect gateway
+		ok(""),            // nsenter nft -f -
+		ok(""),            // exec verify
+	}
+	spec := Spec{
+		Name:          "sb-files-egress",
+		Image:         "test/img:latest",
+		Profile:       ProfileHeadless,
+		NetworkPolicy: NetworkPolicyInternalOnly,
+		Files:         []File{{Path: "/etc/app/x", Data: []byte("d"), Mode: 0o600}},
+	}
+	if _, err := b.Create(context.Background(), spec); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if r.calls[1].args[1] != "create" || r.calls[2].args[1] != "cp" || r.calls[3].args[1] != "start" {
+		t.Fatalf("wrong sequence before egress: %v %v %v", r.calls[1].args[1], r.calls[2].args[1], r.calls[3].args[1])
+	}
+	if !sawNsenterNftLoad(r.calls) || !sawEgressVerify(r.calls) {
+		t.Errorf("expected host-applied egress after start; calls: %v", r.calls)
+	}
+}
+
+// TestCreate_Files_Invalid verifies bad Files entries fail before anything is
+// created: no volume, no container, zero runner calls.
+func TestCreate_Files_Invalid(t *testing.T) {
+	cases := []struct {
+		name string
+		file File
+	}{
+		{"relative", File{Path: "etc/x", Data: []byte("d"), Mode: 0o600}},
+		{"traversal", File{Path: "/etc/../x", Data: []byte("d"), Mode: 0o600}},
+		{"trailing-slash", File{Path: "/etc/x/", Data: []byte("d"), Mode: 0o600}},
+		{"doubled-slash", File{Path: "/etc//x", Data: []byte("d"), Mode: 0o600}},
+		{"root", File{Path: "/", Data: []byte("d"), Mode: 0o600}},
+		{"zero-mode", File{Path: "/etc/x", Data: []byte("d")}},
+		{"type-bits", File{Path: "/etc/x", Data: []byte("d"), Mode: fs.ModeDir | 0o755}},
+		{"negative-uid", File{Path: "/etc/x", Data: []byte("d"), Mode: 0o600, UID: -1}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &mockRunner{}
+			b := newTestBackend(r)
+			spec := Spec{
+				Name:          "sb-files-bad",
+				NetworkPolicy: NetworkPolicyOpen,
+				Image:         "test/img:latest",
+				Profile:       ProfileHeadless,
+				Files:         []File{tc.file},
+			}
+			if _, err := b.Create(context.Background(), spec); err == nil {
+				t.Fatalf("expected validation error for %s", tc.name)
+			}
+			if len(r.calls) != 0 {
+				t.Fatalf("expected zero runner calls, got %d: %v", len(r.calls), r.calls)
+			}
+		})
+	}
+
+	t.Run("duplicate-path", func(t *testing.T) {
+		r := &mockRunner{}
+		b := newTestBackend(r)
+		spec := Spec{
+			Name:          "sb-files-dup",
+			NetworkPolicy: NetworkPolicyOpen,
+			Image:         "test/img:latest",
+			Profile:       ProfileHeadless,
+			Files: []File{
+				{Path: "/etc/x", Data: []byte("a"), Mode: 0o600},
+				{Path: "/etc/x", Data: []byte("b"), Mode: 0o644},
+			},
+		}
+		if _, err := b.Create(context.Background(), spec); err == nil {
+			t.Fatal("expected error for duplicate file path")
+		}
+		if len(r.calls) != 0 {
+			t.Fatalf("expected zero runner calls, got %d", len(r.calls))
+		}
+	})
+}
+
+// TestCreate_Files_FailuresDestroy verifies fail-closed cleanup: if the copy
+// or the subsequent start fails, the half-provisioned container is destroyed
+// rather than left behind (stopped, without its files, or both).
+func TestCreate_Files_FailuresDestroy(t *testing.T) {
+	spec := Spec{
+		Name:          "sb-files-fail",
+		NetworkPolicy: NetworkPolicyOpen,
+		Image:         "test/img:latest",
+		Profile:       ProfileHeadless,
+		Files:         []File{{Path: "/etc/app/x", Data: []byte("d"), Mode: 0o600}},
+	}
+
+	t.Run("cp-fails", func(t *testing.T) {
+		r := &mockRunner{}
+		b := newTestBackend(r)
+		r.responses = []mockResponse{
+			ok(""), ok("cid\n"), fail("cp exploded"),
+			ok(""), ok(""), ok(""), // Destroy: stop, rm, volume rm
+		}
+		if _, err := b.Create(context.Background(), spec); err == nil {
+			t.Fatal("expected error when cp fails")
+		}
+		if !sawDestroy(r.calls) {
+			t.Errorf("expected container teardown after cp failure; calls: %v", r.calls)
+		}
+	})
+
+	t.Run("start-fails", func(t *testing.T) {
+		r := &mockRunner{}
+		b := newTestBackend(r)
+		r.responses = []mockResponse{
+			ok(""), ok("cid\n"), ok(""), fail("start exploded"),
+			ok(""), ok(""), ok(""), // Destroy: stop, rm, volume rm
+		}
+		if _, err := b.Create(context.Background(), spec); err == nil {
+			t.Fatal("expected error when start fails")
+		}
+		if !sawDestroy(r.calls) {
+			t.Errorf("expected container teardown after start failure; calls: %v", r.calls)
+		}
+	})
+}
+
+// TestCreate_NoFiles_KeepsRunDash verifies the no-Files path is unchanged:
+// a single `podman run -d` and no cp/start calls.
+func TestCreate_NoFiles_KeepsRunDash(t *testing.T) {
+	r := &mockRunner{}
+	b := newTestBackend(r)
+	r.responses = []mockResponse{ok(""), ok("cid\n")}
+
+	spec := Spec{
+		Name:          "sb-nofiles",
+		NetworkPolicy: NetworkPolicyOpen,
+		Image:         "test/img:latest",
+		Profile:       ProfileHeadless,
+	}
+	if _, err := b.Create(context.Background(), spec); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if len(r.calls) != 2 {
+		t.Fatalf("expected 2 calls (volume, run), got %d", len(r.calls))
+	}
+	if r.calls[1].args[1] != "run" || !containsArg(r.calls[1].args, "-d") {
+		t.Errorf("no-Files path must remain 'run -d': %s", argString(r.calls[1].args))
+	}
+}
+
+// ---- CommandError tests --------------------------------------------------------
+
+// TestCommandError_WithholdsStderr is the leak guard for tool stderr: a podman
+// failure whose stderr quotes sensitive text must produce an error whose
+// string never contains that text, while Detail() still hands it to a caller
+// who asks by name and the exec.ExitError stays reachable for exit codes.
+func TestCommandError_WithholdsStderr(t *testing.T) {
+	const leaked = "BOT_TOKEN=123456:AAsekret"
+	r := &mockRunner{}
+	b := newTestBackend(r)
+	r.responses = []mockResponse{
+		ok(""), // volume create
+		{stderr: []byte("Error: invalid flag near " + leaked), err: &exec.ExitError{ProcessState: &os.ProcessState{}}},
+	}
+
+	_, err := b.Create(context.Background(), Spec{
+		Name:          "sb-cmderr",
+		NetworkPolicy: NetworkPolicyOpen,
+		Image:         "test/img:latest",
+		Profile:       ProfileHeadless,
+	})
+	if err == nil {
+		t.Fatal("expected error from failing run")
+	}
+	if strings.Contains(err.Error(), leaked) {
+		t.Errorf("error string leaks tool stderr: %q", err.Error())
+	}
+	var ce *CommandError
+	if !errors.As(err, &ce) {
+		t.Fatalf("errors.As(*CommandError) failed for %T: %v", err, err)
+	}
+	if !strings.Contains(ce.Detail(), leaked) {
+		t.Errorf("Detail() = %q, want the tool's stderr", ce.Detail())
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Error("exec.ExitError no longer reachable through the chain")
+	}
+}
+
+// TestDestroy_NotFoundViaCommandErrorDetail verifies the "not found" tolerance
+// still works now that podman's stderr lives in CommandError.Detail rather
+// than the error string.
+func TestDestroy_NotFoundViaCommandErrorDetail(t *testing.T) {
+	r := &mockRunner{}
+	b := newTestBackend(r)
+	exit := &exec.ExitError{ProcessState: &os.ProcessState{}}
+	r.responses = []mockResponse{
+		ok(""), // stop
+		{stderr: []byte("Error: no such container sbx-sb-gone"), err: exit},   // rm
+		{stderr: []byte("Error: no such volume sbx-sb-gone-work"), err: exit}, // volume rm
+	}
+	if err := b.Destroy(context.Background(), "sb-gone"); err != nil {
+		t.Fatalf("Destroy must tolerate not-found via CommandError detail: %v", err)
+	}
+}
+
+// TestInspect_NotFoundViaCommandErrorDetail does the same for the
+// ErrSandboxNotFound mapping in Inspect.
+func TestInspect_NotFoundViaCommandErrorDetail(t *testing.T) {
+	r := &mockRunner{}
+	b := newTestBackend(r)
+	r.responses = []mockResponse{
+		{stderr: []byte("Error: no such container sbx-sb-gone"), err: &exec.ExitError{ProcessState: &os.ProcessState{}}},
+	}
+	_, err := b.Inspect(context.Background(), "sb-gone")
+	if !errors.Is(err, ErrSandboxNotFound) {
+		t.Errorf("expected ErrSandboxNotFound via CommandError detail, got %v", err)
 	}
 }

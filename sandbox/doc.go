@@ -27,6 +27,18 @@
 // repository, firewall table — is configurable so that a product can brand its
 // own resources without this package knowing the brand.
 //
+// # What reaches the host's process list
+//
+// Everything on a tool's argv is world-readable on the host for as long as the
+// tool runs (ps, /proc/<pid>/cmdline), and callers put credentials in Spec.Env.
+// This package therefore never places an environment VALUE on an argv: Spec.Env
+// and ExecOpts.Env travel as name-only "--env K" flags, with the values passed
+// through the tool's own process environment, which the kernel exposes only to
+// the same user and root. Spec.Files content travels on stdin. Error strings
+// keep the same discipline: a tool's stderr — which can quote fragments of its
+// invocation — is withheld from Error and available through
+// [CommandError.Detail] for whoever deliberately asks.
+//
 // # Portability
 //
 // This package compiles on every platform Go supports, and is functionally
