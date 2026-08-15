@@ -13,11 +13,23 @@ nothing about whatever product is using it.
 **keel owns mechanisms. Consuming products own their domain model and their schema.**
 
 The enforceable version: keel imports nothing from its consumers, and no exported keel
-function signature contains a domain noun — no `Org`, `User`, `Workspace`, `Space`,
-`Member` or `Role`. The moment a function needs one of those, it belongs in the product
-instead.
+function signature contains a **product** domain noun — no `Org`, `User`, `Workspace`,
+`Space`, `Member` or `Role`. The moment a function needs one of those, it belongs in the
+product instead.
 
 That single constraint is what stops a shared core from accreting into a framework.
+
+**One carve-out, because two extractions ran into it.** Where a term is the vocabulary of
+an external protocol or tool that keel is wrapping, keel uses that term. `ChatMessage.Role`
+stays `Role` because that is what the field is called in every provider's API, in the JSON
+on the wire, and in the head of anyone who will use the package; renaming it would satisfy
+the letter of the rule by making the library surprising to its entire audience. The rule
+exists to keep *someone else's product model* out of keel, not to make keel invent private
+names for public protocols.
+
+The carve-out is permissive, not mandatory. Where an equally clear alternative exists,
+prefer it — `sandbox.ExecOpts.RunAs` reads at least as well as `User` and removes the
+ambiguity, so it stays renamed.
 
 ## Packages
 
@@ -32,6 +44,45 @@ That single constraint is what stops a shared core from accreting into a framewo
 
 Dependencies are kept near zero by design — a module you import into everything must
 not drag a tree behind it.
+
+## Known limitations
+
+Recorded here rather than only in package docs, because each one is the kind of thing a
+caller could reasonably assume the opposite of.
+
+**`sandbox` — the two backends do not have equivalent network isolation.** The Podman
+backend enforces egress policy and fails closed. The QEMU backend currently does not
+enforce it at all: both `NetworkPolicyFiltered` and `NetworkPolicyInternalOnly` produce
+plain user-mode networking. A caller assuming parity between backends is wrong today, so
+choose Podman where egress policy is load-bearing.
+
+**`sandbox` — `AllowDomains` pins IP addresses at creation time** via a single lookup.
+DNS rotation silently breaks the allowlist, and a lookup that fails is skipped rather
+than raised.
+
+**`sandbox` — QEMU guest context IDs are allocated per-process and in-memory.** Two
+backend instances, or a restart, can hand the same CID to different sandboxes.
+
+**`sandbox` — liveness detection is Linux-only in practice.** Off Linux, a dead VM is
+reported as running, because `os.FindProcess` succeeds for any pid.
+
+**`vault` — AAD is anti-confusion, not authorization.** An open vault will decrypt any
+record whose AAD the caller supplies. The confused-deputy hole is closed only if callers
+pass the identity they were *asked for*, never one read out of the record they just
+fetched. Passing an id taken from stored data reconstructs the hole with extra steps,
+and every test still passes.
+
+**`vault` — the key record has no freshness or monotonicity.** Anyone who can write it
+can roll it back to an earlier version and re-enable a passphrase that was rotated away.
+Treat keyring writes with the same care as data writes.
+
+**`vault` — every unlock allocates 64 MiB for Argon2id.** An unlock path reachable from
+untrusted input is a memory-exhaustion lever. Bound derivation concurrency and rate-limit
+attempts in the caller; the package deliberately has no opinion about who is allowed to
+try.
+
+**`vault` — there is no DEK rotation.** `Rotate` changes the passphrase, not the data
+key. A leaked data key means re-sealing everything.
 
 ## Status
 

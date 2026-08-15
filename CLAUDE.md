@@ -11,12 +11,19 @@ anyone's domain model.
 Enforceable form:
 
 - keel imports nothing from its consumers.
-- **No exported keel identifier contains or accepts a domain noun** — no `Org`, `User`,
-  `Workspace`, `Space`, `Member`, `Role`.
+- **No exported keel identifier contains or accepts a product domain noun** — no `Org`,
+  `User`, `Workspace`, `Space`, `Member`, `Role`.
 
 When a function needs one of those, it belongs in the product instead. This constraint
 is what stops a shared core from accreting into a framework, which is the normal fate of
 these. Enforce it on every change; a single exception is how it starts.
+
+**The carve-out** — where a term is the vocabulary of an external protocol or tool keel
+wraps, keel uses that term. `llm.ChatMessage.Role` keeps its name because that is the
+field's name in every provider API and in the JSON on the wire. The rule keeps someone
+else's *product model* out of keel; it does not require inventing private names for
+public protocols. Permissive, not mandatory: where an equally clear alternative exists,
+prefer it (`sandbox.ExecOpts.RunAs` over `User`).
 
 Before adding a package, ask whether it has two real consumers. A shared library
 designed against one consumer is a guess.
