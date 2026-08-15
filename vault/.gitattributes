@@ -1,0 +1,2 @@
+# Go fuzz corpus files are byte-exact inputs; CRLF conversion corrupts them.
+testdata/fuzz/** -text
