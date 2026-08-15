@@ -48,6 +48,13 @@
 // trusting both the old and new key, start signing with the new key, then
 // drop the old key in a later release.
 //
+// Note for consumers: Config.MaxManifestAge defaults to OFF, so replay of
+// an old, correctly-signed manifest is unbounded by default (it can never
+// downgrade a deployment, but it can hide newer releases indefinitely).
+// Set MaxManifestAge — comfortably longer than your slowest release cadence
+// — so a frozen or replayed manifest is eventually detected rather than
+// trusted forever.
+//
 // # Health checks
 //
 // The health check supplied in Config.Health decides whether a freshly
@@ -60,6 +67,29 @@
 // next check, and roll it back again — an endless loop that ends with a
 // wedged installation. Health means "this binary works", not "the world is
 // reachable".
+//
+// # Preflight
+//
+// Rollback happens inside the new binary's Resume, so a build broken enough
+// that it never starts — a bad dynamic link, an immediate crash at exec, a
+// corrupt artifact that still hashed correctly — could never roll itself
+// back. The preflight closes that path: before the swap, the staged binary
+// is executed with Config.PreflightArgs and must exit 0 within
+// Config.PreflightTimeout, while the old binary is still safely in place.
+// A failure refuses the update with ErrPreflight and changes nothing on
+// disk: the deployment stays on its old version and says why, instead of
+// bricking until someone intervenes by hand. The check is skippable only by
+// setting Config.SkipPreflight explicitly.
+//
+// # Cross-process locking
+//
+// Deployments that run several processes off one install path (one pod per
+// participant on the same machine) contend on a lock file beside the
+// target, held across the swap and across Resume. Exactly one process
+// proceeds; the others receive ErrLocked, which means "a sibling is
+// handling it": skip the cycle quietly and retry on the next check —
+// nothing is wrong. A lock left behind by a crashed updater is broken after
+// Config.LockStaleAfter (default 10 minutes).
 //
 // # The swap, exactly
 //

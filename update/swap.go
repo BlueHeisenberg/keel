@@ -217,7 +217,7 @@ func performSwap(fsys fsOps, j journal, windowsStyle bool) error {
 			if rerr := fsys.Rename(j.Old, j.Target); rerr != nil {
 				// Target is missing and could not be restored in-process.
 				// The journal stays on disk so Resume/repair can fix it.
-				return fmt.Errorf("update: install new binary failed (%v) and restoring the previous one failed (%v); journal retained for repair", err, rerr)
+				return fmt.Errorf("update: install new binary failed (%w) and restoring the previous one failed (%v); journal retained for repair", err, rerr)
 			}
 		}
 		_ = fsys.Remove(j.Prev)
@@ -305,7 +305,7 @@ func performRepair(fsys fsOps, j journal) error {
 // swap that never took effect (crash before the final rename). The target
 // must already exist — run performRepair first when it does not.
 func performAbort(fsys fsOps, j journal) error {
-	for _, p := range []string{j.Staged, j.Prev, j.Old} {
+	for _, p := range []string{j.Staged, j.Prev, j.Old, j.Target + ".failed"} {
 		if p == "" {
 			continue
 		}

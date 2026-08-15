@@ -12,8 +12,10 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 )
@@ -70,6 +72,11 @@ var (
 	ErrUpdateInProgress = errors.New("update: an update is already pending; call Resume first")
 	ErrRestartPending   = errors.New("update: binary swapped; restart the process to continue")
 	ErrStale            = errors.New("update: manifest is older than the configured maximum age")
+	// ErrPreflight: the staged binary could not be executed successfully
+	// before the swap. The update is refused and the running system is left
+	// untouched — a binary that cannot even start would never reach Resume,
+	// so it must never reach the target path either.
+	ErrPreflight = errors.New("update: staged binary failed preflight; update refused")
 )
 
 // Config wires an Updater. ManifestURL and at least one trusted key are
@@ -102,6 +109,30 @@ type Config struct {
 	MaxManifestAge time.Duration
 	// HealthTimeout bounds the post-restart health check. Defaults to 30s.
 	HealthTimeout time.Duration
+
+	// PreflightArgs are the arguments the staged binary is executed with
+	// before the swap (kenward uses ["version"]). The staged binary must
+	// exit 0 within PreflightTimeout or the update is refused with
+	// ErrPreflight and nothing on disk changes. This is the only guard
+	// against a build broken enough that it would never start — such a
+	// binary can never be rolled back by Resume, because Resume runs
+	// inside it. Required unless SkipPreflight is set or the channel is
+	// off: a deployment that cannot exec the staged file is exactly the
+	// deployment that most needs this check.
+	PreflightArgs []string
+	// PreflightTimeout bounds the preflight execution. Defaults to 10s.
+	// A hang is a failure.
+	PreflightTimeout time.Duration
+	// SkipPreflight disables the preflight check. It must be an explicit
+	// decision; there is no implicit default that skips it.
+	SkipPreflight bool
+
+	// LockStaleAfter is how old the cross-process lock file may be before
+	// it is presumed abandoned by a crashed updater and broken. Defaults
+	// to 10 minutes. The lock serialises processes sharing one install
+	// path (per-participant pods on one machine); the loser receives
+	// ErrLocked, skips the cycle quietly, and retries on its next check.
+	LockStaleAfter time.Duration
 
 	HTTPClient *http.Client
 	Logger     *slog.Logger
@@ -193,8 +224,14 @@ func New(cfg Config) (*Updater, error) {
 	if err != nil {
 		return nil, fmt.Errorf("update: invalid current version: %w", err)
 	}
+	if cfg.Channel != ChannelOff && !cfg.SkipPreflight && len(cfg.PreflightArgs) == 0 {
+		return nil, errors.New("update: PreflightArgs is required (e.g. [\"version\"]); set SkipPreflight explicitly to run without a preflight check")
+	}
 	if cfg.HealthTimeout <= 0 {
 		cfg.HealthTimeout = 30 * time.Second
+	}
+	if cfg.PreflightTimeout <= 0 {
+		cfg.PreflightTimeout = 10 * time.Second
 	}
 	if cfg.CheckInterval <= 0 {
 		cfg.CheckInterval = 6 * time.Hour
@@ -380,11 +417,47 @@ func (u *Updater) Apply(ctx context.Context, rel Release) error {
 		return fmt.Errorf("update: chmod staged binary: %w", err)
 	}
 
+	// Preflight: the staged binary must prove it can execute BEFORE it is
+	// installed. A build that cannot start would never reach Resume, so
+	// post-swap rollback cannot save it — this check runs while the old
+	// binary is still safely in place.
+	if !u.cfg.SkipPreflight {
+		if perr := u.preflight(ctx, staged); perr != nil {
+			_ = os.Remove(staged)
+			return fmt.Errorf("%w: %v", ErrPreflight, perr)
+		}
+	}
+
+	// Drain after preflight: never make participants wait for an update
+	// that was going to be refused anyway.
 	if u.cfg.Drain != nil {
 		if err := u.cfg.Drain(ctx); err != nil {
 			_ = os.Remove(staged)
 			return fmt.Errorf("update: drain before swap: %w", err)
 		}
+	}
+
+	// Cross-process lock: processes sharing this install path serialise
+	// here. The loser removes its own staged download and skips quietly.
+	rel0, lerr := acquireLock(u.target, u.cfg.LockStaleAfter, u.now)
+	if lerr != nil {
+		_ = os.Remove(staged)
+		return lerr
+	}
+	locked := true
+	release := func() {
+		if locked {
+			locked = false
+			rel0()
+		}
+	}
+	defer release()
+
+	// Re-check the journal under the lock: another process may have
+	// swapped while this one was downloading.
+	if _, err := u.fs.Stat(journalPath(u.target)); err == nil {
+		_ = os.Remove(staged)
+		return ErrUpdateInProgress
 	}
 
 	j := journal{
@@ -400,10 +473,38 @@ func (u *Updater) Apply(ctx context.Context, rel Release) error {
 	}
 	u.log.Info("update: binary swapped", "from", u.current.String(), "to", rel.Version, "target", u.target)
 
+	// Release before restarting: a Restart hook that exits or re-execs the
+	// process would otherwise strand the lock file until it went stale.
+	release()
 	if u.cfg.Restart == nil {
 		return ErrRestartPending
 	}
 	return u.cfg.Restart(ctx)
+}
+
+// preflight executes the staged binary with the configured arguments and
+// requires a clean exit within PreflightTimeout. Any failure to start, a
+// non-zero exit, or a hang refuses the update.
+func (u *Updater) preflight(ctx context.Context, staged string) error {
+	pctx, cancel := context.WithTimeout(ctx, u.cfg.PreflightTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(pctx, staged, u.cfg.PreflightArgs...)
+	out, err := cmd.CombinedOutput()
+	if pctx.Err() == context.DeadlineExceeded {
+		return fmt.Errorf("staged binary did not exit within %s running %q", u.cfg.PreflightTimeout, u.cfg.PreflightArgs)
+	}
+	if err != nil {
+		return fmt.Errorf("staged binary failed running %q: %v (output: %s)", u.cfg.PreflightArgs, err, truncateOutput(out, 512))
+	}
+	return nil
+}
+
+func truncateOutput(b []byte, n int) string {
+	s := strings.TrimSpace(string(b))
+	if len(s) > n {
+		return s[:n] + "…"
+	}
+	return s
 }
 
 // Resume finishes whatever update was in flight when the process last
@@ -425,9 +526,30 @@ func (u *Updater) Resume(ctx context.Context) (ResumeReport, error) {
 	if u.target == "" {
 		return ResumeReport{Outcome: OutcomeNone}, nil
 	}
+	// Resume mutates the same files as a swap, so it takes the same
+	// cross-process lock. A sibling holding it returns ErrLocked; the
+	// caller retries shortly rather than treating it as a failure.
+	rel0, lerr := acquireLock(u.target, u.cfg.LockStaleAfter, u.now)
+	if lerr != nil {
+		return ResumeReport{}, lerr
+	}
+	locked := true
+	release := func() {
+		if locked {
+			locked = false
+			rel0()
+		}
+	}
+	defer release()
+
 	j, err := readJournal(u.fs, u.target)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
+			// No update in flight. Sweep files a crash could have orphaned
+			// before the journal existed (a staged download, atomic-write
+			// temp files, a .old/.failed image whose removal was skipped).
+			// The retained .prev is deliberately NOT swept.
+			u.sweepStale()
 			return ResumeReport{Outcome: OutcomeNone}, nil
 		}
 		return ResumeReport{}, err
@@ -462,18 +584,18 @@ func (u *Updater) Resume(ctx context.Context) (ResumeReport, error) {
 			}
 			rep.Outcome = OutcomeRolledBack
 			rep.Reason = j.Reason
-			return rep, u.restartOrPending(ctx)
+			return rep, u.restartOrPending(ctx, release)
 		}
 		j.Attempts++
 		if j.Attempts > maxResumeAttempts {
 			reason := fmt.Sprintf("update: %d verification attempts without a passing health check", j.Attempts-1)
-			return u.rollback(ctx, rep, j, reason)
+			return u.rollback(ctx, rep, j, reason, release)
 		}
 		if err := writeJournal(u.fs, j); err != nil {
 			return rep, err
 		}
 		if herr := u.runHealth(ctx); herr != nil {
-			return u.rollback(ctx, rep, j, "health check failed: "+herr.Error())
+			return u.rollback(ctx, rep, j, "health check failed: "+herr.Error(), release)
 		}
 		if err := performCommit(u.fs, j); err != nil {
 			return rep, err
@@ -516,17 +638,41 @@ func (u *Updater) Resume(ctx context.Context) (ResumeReport, error) {
 	}
 }
 
-func (u *Updater) rollback(ctx context.Context, rep ResumeReport, j journal, reason string) (ResumeReport, error) {
+func (u *Updater) rollback(ctx context.Context, rep ResumeReport, j journal, reason string, release func()) (ResumeReport, error) {
 	if err := performRollback(u.fs, j, reason, u.winSwap); err != nil {
 		return rep, fmt.Errorf("update: rollback after %q: %w", reason, err)
 	}
 	rep.Outcome = OutcomeRolledBack
 	rep.Reason = reason
 	u.log.Warn("update: rolling back", "from", j.From, "to", j.To, "reason", reason)
-	return rep, u.restartOrPending(ctx)
+	return rep, u.restartOrPending(ctx, release)
 }
 
-func (u *Updater) restartOrPending(ctx context.Context) error {
+// sweepStale removes best-effort the debris a crash can orphan when no
+// journal references it. It never touches the target or the retained
+// previous binary.
+func (u *Updater) sweepStale() {
+	if matches, err := filepath.Glob(u.target + ".staged-*"); err == nil {
+		for _, m := range matches {
+			_ = os.Remove(m)
+		}
+	}
+	for _, p := range []string{
+		journalPath(u.target) + ".tmp",
+		u.target + ".prev.tmp",
+		u.target + ".old",
+		u.target + ".failed",
+	} {
+		_ = os.Remove(p)
+	}
+}
+
+// restartOrPending releases the cross-process lock (the journal now owns the
+// state) and then restarts, or reports that a restart is the caller's job.
+// Releasing first matters: a Restart hook that exits or re-execs would strand
+// the lock file until it went stale.
+func (u *Updater) restartOrPending(ctx context.Context, release func()) error {
+	release()
 	if u.cfg.Restart == nil {
 		return ErrRestartPending
 	}
@@ -587,6 +733,10 @@ func (u *Updater) Run(ctx context.Context) error {
 				case errors.Is(err, ErrConsentDeclined):
 					u.declined[ver] = true
 					u.log.Info("update: declined by consent; will not re-ask for this version", "version", ver)
+				case errors.Is(err, ErrLocked), errors.Is(err, ErrUpdateInProgress):
+					// A sibling process is handling it. Nothing is wrong;
+					// skip quietly and look again next cycle.
+					u.log.Debug("update: skipped this cycle", "reason", err)
 				default:
 					u.log.Warn("update: apply failed", "version", ver, "err", err)
 				}
