@@ -257,7 +257,7 @@ type Status struct {
 //
 // All methods accept a context; callers should pass a request-scoped context
 // with an appropriate timeout.  Methods that mutate container state (Create,
-// Start, Stop, Destroy, Restore) should be treated as not concurrency-safe for
+// Start, Stop, Recreate, Purge, Restore) should be treated as not concurrency-safe for
 // the same sandbox ID — the caller must serialise them.
 type Backend interface {
 	// Create provisions a new sandbox from Spec and starts it (or leaves it
@@ -270,12 +270,44 @@ type Backend interface {
 	Start(ctx context.Context, id string) error
 
 	// Stop gracefully stops a running sandbox (SIGTERM → wait).  The
-	// container's filesystem is preserved for a subsequent Start or Destroy.
+	// container's filesystem is preserved for a subsequent Start or Purge.
 	Stop(ctx context.Context, id string) error
 
-	// Destroy stops (if running) and removes the sandbox, including its named
-	// work volume.  Irreversible.
-	Destroy(ctx context.Context, id string) error
+	// Recreate replaces the sandbox's runtime — the container or VM process —
+	// with one built from spec, while preserving the sandbox's work volume and
+	// everything on it.  spec.Name selects the sandbox; the other fields,
+	// including a new Image, take effect as in Create.  This is the operation
+	// a rolling image update needs: no path through Recreate deletes the
+	// volume, structurally, so a caller cannot lose data to it.
+	//
+	// The volume surviving is this package's guarantee; whether the new image
+	// can read what the old one wrote is the caller's compatibility problem.
+	// keel owns the mechanism (the volume is still there); the consumer owns
+	// its schema and any migration between versions of it.
+	//
+	// Recreate does no sequencing.  Rolling one sandbox at a time, draining
+	// first, or stopping on the first failure is policy, and policy belongs to
+	// the caller.
+	//
+	// On the QEMU backend the disk image cannot change: an overlay is bound to
+	// the base image it was created from, so a non-empty spec.Image is
+	// rejected with ErrSpecUnsupported (a new base disk requires Purge and
+	// Create, which deletes the data — deliberately not reachable from here).
+	Recreate(ctx context.Context, spec Spec) (Handle, error)
+
+	// Purge stops (if running) and removes the sandbox INCLUDING its named
+	// work volume — the caller's data.  Irreversible.  It is the only method
+	// in this interface that deletes the volume; every other operation,
+	// Recreate above in particular, leaves it in place.
+	//
+	// This method was named Destroy before v0.5.0.  It was renamed because
+	// deleting a consumer's data must never hide behind a routine
+	// infrastructure verb: a supervisor that means "remove the old container"
+	// must not be able to reach for a name that also, silently, means "and
+	// the data".  If you are migrating a Destroy call, decide which you meant:
+	// container replacement is Recreate, retiring the sandbox and its data is
+	// Purge.
+	Purge(ctx context.Context, id string) error
 
 	// Exec runs cmd inside the sandbox and returns the collected result.
 	// stdin is not supported; use ExecStream for interactive use.

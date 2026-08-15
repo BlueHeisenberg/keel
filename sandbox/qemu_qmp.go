@@ -70,7 +70,7 @@ func (q *realQMPConn) handshake() error {
 }
 
 // qmpCommandTimeout bounds a single QMP command's write+read so a chatty or
-// half-dead QMP socket cannot hang Stop/Destroy/Snapshot/Restore/Inspect.
+// half-dead QMP socket cannot hang Stop/Purge/Snapshot/Restore/Inspect.
 // Fixed (not ctx-derived) for simplicity; documented here.
 const qmpCommandTimeout = 10 * time.Second
 

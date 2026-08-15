@@ -58,7 +58,7 @@ func TestQemuLifecycle(t *testing.T) {
 	if h.ID != id {
 		t.Errorf("Handle.ID = %q, want %q", h.ID, id)
 	}
-	t.Cleanup(func() { _ = b.Destroy(context.Background(), id) })
+	t.Cleanup(func() { _ = b.Purge(context.Background(), id) })
 
 	// Give the VM a moment to come up, then confirm it's running.
 	deadline := time.Now().Add(20 * time.Second)
@@ -78,7 +78,7 @@ func TestQemuLifecycle(t *testing.T) {
 		t.Fatalf("VM did not report running within deadline")
 	}
 
-	if err := b.Destroy(ctx, id); err != nil {
-		t.Fatalf("Destroy: %v", err)
+	if err := b.Purge(ctx, id); err != nil {
+		t.Fatalf("Purge: %v", err)
 	}
 }

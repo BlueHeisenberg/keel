@@ -687,9 +687,12 @@ func TestWebEndpoint(t *testing.T) {
 	}
 }
 
-// ---- Destroy tests ---------------------------------------------------------
+// ---- Purge tests -------------------------------------------------------------
 
-func TestDestroy_ArgSequence(t *testing.T) {
+// TestPurge_ArgSequence verifies the explicitly destructive operation still
+// destroys when explicitly asked: container stopped, removed, AND the work
+// volume removed.  Purge is the only method allowed to issue that volume rm.
+func TestPurge_ArgSequence(t *testing.T) {
 	r := &mockRunner{}
 	b := newTestBackend(r)
 	r.responses = []mockResponse{
@@ -698,8 +701,8 @@ func TestDestroy_ArgSequence(t *testing.T) {
 		ok(""), // volume rm
 	}
 
-	if err := b.Destroy(context.Background(), "sb-destroy-1"); err != nil {
-		t.Fatalf("Destroy: %v", err)
+	if err := b.Purge(context.Background(), "sb-destroy-1"); err != nil {
+		t.Fatalf("Purge: %v", err)
 	}
 
 	if len(r.calls) != 3 {
@@ -1104,7 +1107,9 @@ func TestPodman_RejectsMaliciousID(t *testing.T) {
 			assertRejected("Create", err)
 			assertRejected("Start", b.Start(ctx, id))
 			assertRejected("Stop", b.Stop(ctx, id))
-			assertRejected("Destroy", b.Destroy(ctx, id))
+			assertRejected("Purge", b.Purge(ctx, id))
+			_, err = b.Recreate(ctx, Spec{Name: id, Image: "test/img:latest", Profile: ProfileHeadless})
+			assertRejected("Recreate", err)
 			_, err = b.Exec(ctx, id, []string{"echo", "hi"}, ExecOpts{})
 			assertRejected("Exec", err)
 			_, err = b.ExecStream(ctx, id, []string{"echo", "hi"}, ExecOpts{})
@@ -1553,10 +1558,10 @@ func TestCommandError_WithholdsStderr(t *testing.T) {
 	}
 }
 
-// TestDestroy_NotFoundViaCommandErrorDetail verifies the "not found" tolerance
+// TestPurge_NotFoundViaCommandErrorDetail verifies the "not found" tolerance
 // still works now that podman's stderr lives in CommandError.Detail rather
 // than the error string.
-func TestDestroy_NotFoundViaCommandErrorDetail(t *testing.T) {
+func TestPurge_NotFoundViaCommandErrorDetail(t *testing.T) {
 	r := &mockRunner{}
 	b := newTestBackend(r)
 	exit := &exec.ExitError{ProcessState: &os.ProcessState{}}
@@ -1565,9 +1570,164 @@ func TestDestroy_NotFoundViaCommandErrorDetail(t *testing.T) {
 		{stderr: []byte("Error: no such container sbx-sb-gone"), err: exit},   // rm
 		{stderr: []byte("Error: no such volume sbx-sb-gone-work"), err: exit}, // volume rm
 	}
-	if err := b.Destroy(context.Background(), "sb-gone"); err != nil {
-		t.Fatalf("Destroy must tolerate not-found via CommandError detail: %v", err)
+	if err := b.Purge(context.Background(), "sb-gone"); err != nil {
+		t.Fatalf("Purge must tolerate not-found via CommandError detail: %v", err)
 	}
+}
+
+// ---- Recreate tests ------------------------------------------------------------
+
+// sawVolumeCommand reports whether any recorded call was a `podman volume ...`
+// subcommand (create, rm, anything).  Recreate must never produce one.
+func sawVolumeCommand(calls []call) bool {
+	for _, c := range calls {
+		if len(c.args) > 1 && c.args[1] == "volume" {
+			return true
+		}
+	}
+	return false
+}
+
+// TestRecreate_PreservesVolume verifies the rolling-update mechanism: the old
+// container is removed, a new one is created from the NEW image, the same
+// named work volume is reattached — and no volume command of any kind runs, so
+// the caller's data cannot be deleted by the operation.
+func TestRecreate_PreservesVolume(t *testing.T) {
+	r := &mockRunner{}
+	b := newTestBackend(r)
+	r.responses = []mockResponse{
+		ok(""),         // stop old container
+		ok(""),         // rm old container
+		ok("newcid\n"), // run new container
+	}
+
+	h, err := b.Recreate(context.Background(), Spec{
+		Name:          "sb-roll-1",
+		NetworkPolicy: NetworkPolicyOpen,
+		Image:         "test/img:v2",
+		Profile:       ProfileHeadless,
+	})
+	if err != nil {
+		t.Fatalf("Recreate: %v", err)
+	}
+	if h.ID != "sb-roll-1" || h.ContainerID != "newcid" {
+		t.Errorf("Handle = %+v, want ID sb-roll-1 / ContainerID newcid", h)
+	}
+	if len(r.calls) != 3 {
+		t.Fatalf("expected 3 calls (stop, rm, run), got %d: %v", len(r.calls), r.calls)
+	}
+	if r.calls[0].args[1] != "stop" || r.calls[1].args[1] != "rm" || r.calls[2].args[1] != "run" {
+		t.Fatalf("wrong sequence: %v %v %v", r.calls[0].args[1], r.calls[1].args[1], r.calls[2].args[1])
+	}
+	// THE guarantee: no `podman volume ...` call anywhere on the path.
+	if sawVolumeCommand(r.calls) {
+		t.Fatalf("Recreate issued a volume command — it must never touch the volume: %v", r.calls)
+	}
+	// The EXISTING volume is reattached by name to the new container.
+	rc := r.calls[2]
+	wantVol := b.volumeName("sb-roll-1") + ":/work"
+	if !hasFlagPair(rc.args, "--volume", wantVol) {
+		t.Errorf("new container must reattach %q: %s", wantVol, argString(rc.args))
+	}
+	// The NEW image is used.
+	if !containsArg(rc.args, "test/img:v2") {
+		t.Errorf("new image missing from run args: %s", argString(rc.args))
+	}
+}
+
+// TestRecreate_ToleratesAbsentContainer verifies Recreate also repairs a
+// sandbox whose container is gone: the rm "no such container" is tolerated and
+// the volume is reattached.
+func TestRecreate_ToleratesAbsentContainer(t *testing.T) {
+	r := &mockRunner{}
+	b := newTestBackend(r)
+	exit := &exec.ExitError{ProcessState: &os.ProcessState{}}
+	r.responses = []mockResponse{
+		{stderr: []byte("Error: no such container sbx-sb-roll-2"), err: exit}, // stop
+		{stderr: []byte("Error: no such container sbx-sb-roll-2"), err: exit}, // rm
+		ok("cid\n"), // run
+	}
+	if _, err := b.Recreate(context.Background(), Spec{
+		Name:          "sb-roll-2",
+		NetworkPolicy: NetworkPolicyOpen,
+		Image:         "test/img:v2",
+		Profile:       ProfileHeadless,
+	}); err != nil {
+		t.Fatalf("Recreate with absent container: %v", err)
+	}
+	if sawVolumeCommand(r.calls) {
+		t.Fatal("Recreate issued a volume command")
+	}
+}
+
+// TestRecreate_FailurePathsNeverDeleteVolume is the structural guard the
+// consumer asked for: it drives every failure path reachable from Recreate —
+// egress lockdown failure, file copy failure, start failure — and fails if ANY
+// call on ANY path is a `podman volume` command.  Create's fail-closed cleanup
+// purges the volume it just made; Recreate's must not, because the volume
+// holds the caller's data.
+func TestRecreate_FailurePathsNeverDeleteVolume(t *testing.T) {
+	base := Spec{
+		Name:    "sb-roll-fail",
+		Image:   "test/img:v2",
+		Profile: ProfileHeadless,
+	}
+
+	t.Run("egress-fails", func(t *testing.T) {
+		r := &mockRunner{}
+		b := newTestBackend(r)
+		b.lookPath = fakeLookPath() // no nft/nsenter → egress lockdown fails
+		r.responses = []mockResponse{
+			ok(""), ok(""), ok("cid\n"), // stop, rm, run
+			ok(""), ok(""), // cleanup: stop, rm — and nothing else
+		}
+		spec := base
+		spec.NetworkPolicy = NetworkPolicyInternalOnly
+		if _, err := b.Recreate(context.Background(), spec); err == nil {
+			t.Fatal("expected egress failure")
+		}
+		if sawVolumeCommand(r.calls) {
+			t.Fatalf("volume command reached from Recreate egress-failure path: %v", r.calls)
+		}
+	})
+
+	t.Run("cp-fails", func(t *testing.T) {
+		r := &mockRunner{}
+		b := newTestBackend(r)
+		r.responses = []mockResponse{
+			ok(""), ok(""), ok("cid\n"), // stop, rm, create
+			fail("cp exploded"),
+			ok(""), ok(""), // cleanup: stop, rm — and nothing else
+		}
+		spec := base
+		spec.NetworkPolicy = NetworkPolicyOpen
+		spec.Files = []File{{Path: "/etc/app/x", Data: []byte("d"), Mode: 0o600}}
+		if _, err := b.Recreate(context.Background(), spec); err == nil {
+			t.Fatal("expected cp failure")
+		}
+		if sawVolumeCommand(r.calls) {
+			t.Fatalf("volume command reached from Recreate cp-failure path: %v", r.calls)
+		}
+	})
+
+	t.Run("start-fails", func(t *testing.T) {
+		r := &mockRunner{}
+		b := newTestBackend(r)
+		r.responses = []mockResponse{
+			ok(""), ok(""), ok("cid\n"), ok(""), // stop, rm, create, cp
+			fail("start exploded"),
+			ok(""), ok(""), // cleanup: stop, rm — and nothing else
+		}
+		spec := base
+		spec.NetworkPolicy = NetworkPolicyOpen
+		spec.Files = []File{{Path: "/etc/app/x", Data: []byte("d"), Mode: 0o600}}
+		if _, err := b.Recreate(context.Background(), spec); err == nil {
+			t.Fatal("expected start failure")
+		}
+		if sawVolumeCommand(r.calls) {
+			t.Fatalf("volume command reached from Recreate start-failure path: %v", r.calls)
+		}
+	})
 }
 
 // TestInspect_NotFoundViaCommandErrorDetail does the same for the

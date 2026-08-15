@@ -184,16 +184,101 @@ func (b *PodmanBackend) podmanEnv(ctx context.Context, args []string, stdin []by
 	return stdout, stderr, nil
 }
 
+// validSpec runs the per-spec validations shared by Create and Recreate,
+// before anything on the host is touched.
+func validSpec(spec Spec) error {
+	// Validate the id before it reaches container/volume names or podman args.
+	if err := validID(spec.Name); err != nil {
+		return err
+	}
+	// Validate the provisioned files and environment before anything is
+	// created, so a bad Files or Env entry cannot leave an orphaned volume or
+	// container behind.
+	if err := validFiles(spec.Files); err != nil {
+		return fmt.Errorf("sandbox %s: %w", spec.Name, err)
+	}
+	if err := validEnv(spec.Env); err != nil {
+		return fmt.Errorf("sandbox %s: %w", spec.Name, err)
+	}
+	return nil
+}
+
+// resolveImage picks the image for a spec, falling back to Config.Image.
+// Resolved before anything is created, so a misconfigured backend does not
+// leave an orphaned volume or a half-replaced sandbox behind.
+func (b *PodmanBackend) resolveImage(spec Spec) (string, error) {
+	image := spec.Image
+	if image == "" {
+		image = b.cfg.Image
+	}
+	if image == "" {
+		return "", fmt.Errorf("sandbox %s: no image: set Spec.Image or Config.Image", spec.Name)
+	}
+	return image, nil
+}
+
 // Create implements Backend.Create.
 //
 // The function:
-//  1. Picks a random host port for the noVNC or web endpoint.
-//  2. Creates a named volume for /work.
-//  3. Runs `podman run -d` with the resource limits and labels from Spec.
-//  4. Returns a Handle with the resolved ContainerID and Endpoints.
+//  1. Creates a named volume for /work.
+//  2. Runs `podman run -d` with the resource limits and labels from Spec
+//     (or create → copy files in → start, when Spec.Files is non-empty).
+//  3. Returns a Handle with the resolved ContainerID and Endpoints.
 //
-// The container is started immediately (podman run -d).
+// The container is running when Create returns.
 func (b *PodmanBackend) Create(ctx context.Context, spec Spec) (Handle, error) {
+	if err := validSpec(spec); err != nil {
+		return Handle{}, err
+	}
+	image, err := b.resolveImage(spec)
+	if err != nil {
+		return Handle{}, err
+	}
+
+	// Ensure the named volume exists (idempotent).
+	vol := b.volumeName(spec.Name)
+	if _, _, err := b.podman(ctx, []string{"volume", "create", vol}, nil); err != nil {
+		return Handle{}, fmt.Errorf("sandbox create volume: %w", err)
+	}
+
+	// Create made the volume, so Create's failure cleanup is Purge: a spec
+	// that cannot launch must not leak a container-less volume.
+	return b.launch(ctx, spec, image, "create", b.Purge)
+}
+
+// Recreate implements Backend.Recreate: the container is replaced from spec —
+// a new image included — while the named work volume, and the caller's data on
+// it, survive.  The volume-deleting code (Purge) is not reachable from here:
+// no volume command runs on this path, and every failure cleanup is
+// removeContainer, which cannot touch a volume by construction.
+func (b *PodmanBackend) Recreate(ctx context.Context, spec Spec) (Handle, error) {
+	if err := validSpec(spec); err != nil {
+		return Handle{}, err
+	}
+	image, err := b.resolveImage(spec)
+	if err != nil {
+		return Handle{}, err
+	}
+
+	// Remove the existing container.  An absent container is tolerated so
+	// Recreate can also repair a sandbox whose container was lost.
+	if err := b.removeContainer(ctx, spec.Name); err != nil {
+		return Handle{}, fmt.Errorf("sandbox recreate %s: %w", spec.Name, err)
+	}
+
+	// `--volume <name>:/work` in the launch args reattaches the existing
+	// volume; podman only creates it if it is missing.
+	return b.launch(ctx, spec, image, "recreate", b.removeContainer)
+}
+
+// launch is the shared container-creation flow behind Create and Recreate:
+// argument construction, run/create, file provisioning, host-applied egress,
+// endpoint discovery.  verb names the calling operation in errors and logs.
+// cleanup is invoked with the sandbox id when a step fails after the container
+// exists: Create passes Purge (it owns the volume it just made); Recreate
+// passes removeContainer (the volume predates the call and holds the caller's
+// data, so it must survive every failure path).
+func (b *PodmanBackend) launch(ctx context.Context, spec Spec, image, verb string, cleanup func(context.Context, string) error) (Handle, error) {
 	// Determine which container port to expose and under what logical name.
 	var (
 		containerPort int
@@ -221,45 +306,14 @@ func (b *PodmanBackend) Create(ctx context.Context, spec Spec) (Handle, error) {
 		var err error
 		hostPort, err = pickFreePort()
 		if err != nil {
-			return Handle{}, fmt.Errorf("sandbox create: %w", err)
+			return Handle{}, fmt.Errorf("sandbox %s: %w", verb, err)
 		}
 	}
 
 	// The sandbox is identified by the caller-supplied name.
 	sandboxID := spec.Name
-
-	// Validate the id before it reaches container/volume names or podman args.
-	if err := validID(sandboxID); err != nil {
-		return Handle{}, err
-	}
-
-	// Validate the provisioned files and environment before anything is
-	// created, so a bad Files or Env entry cannot leave an orphaned volume or
-	// container behind.
-	if err := validFiles(spec.Files); err != nil {
-		return Handle{}, fmt.Errorf("sandbox create %s: %w", sandboxID, err)
-	}
-	if err := validEnv(spec.Env); err != nil {
-		return Handle{}, fmt.Errorf("sandbox create %s: %w", sandboxID, err)
-	}
-
-	// Resolve the image before creating anything, so a misconfigured backend
-	// does not leave an orphaned volume behind.
-	image := spec.Image
-	if image == "" {
-		image = b.cfg.Image
-	}
-	if image == "" {
-		return Handle{}, fmt.Errorf("sandbox create %s: no image: set Spec.Image or Config.Image", sandboxID)
-	}
-
 	vol := b.volumeName(sandboxID)
 	cname := b.containerName(sandboxID)
-
-	// Ensure the named volume exists (idempotent).
-	if _, _, err := b.podman(ctx, []string{"volume", "create", vol}, nil); err != nil {
-		return Handle{}, fmt.Errorf("sandbox create volume: %w", err)
-	}
 
 	policy := effectivePolicy(spec.NetworkPolicy)
 
@@ -361,13 +415,14 @@ func (b *PodmanBackend) Create(ctx context.Context, spec Spec) (Handle, error) {
 
 	b.log.Debug("sandbox: creating container",
 		"sandbox", spec.Name,
+		"op", verb,
 		"profile", spec.Profile,
 		"image", image,
 	)
 
 	stdout, _, err := b.podmanEnv(ctx, args, nil, extraEnv)
 	if err != nil {
-		return Handle{}, fmt.Errorf("sandbox create container: %w", err)
+		return Handle{}, fmt.Errorf("sandbox %s container: %w", verb, err)
 	}
 
 	// stdout is the full container ID (64-hex chars + newline).
@@ -375,23 +430,23 @@ func (b *PodmanBackend) Create(ctx context.Context, spec Spec) (Handle, error) {
 
 	// ── File provisioning (create-time) ──────────────────────────────────────
 	// The container exists but has not started, so the files land before the
-	// entrypoint can look for them.  Fail-closed on any error: destroy the
+	// entrypoint can look for them.  Fail-closed on any error: clean up the
 	// container rather than leave one running without the files it was
 	// promised.
 	if provision {
 		if err := b.copyFilesIn(ctx, sandboxID, spec.Files); err != nil {
-			if derr := b.Destroy(ctx, sandboxID); derr != nil {
+			if derr := cleanup(ctx, sandboxID); derr != nil {
 				b.log.Warn("sandbox: file provisioning failed and cleanup also failed",
 					"sandbox", spec.Name, "provision_err", err, "cleanup_err", derr)
 			}
-			return Handle{}, fmt.Errorf("sandbox create: provision files: %w", err)
+			return Handle{}, fmt.Errorf("sandbox %s: provision files: %w", verb, err)
 		}
 		if _, _, err := b.podman(ctx, []string{"start", cname}, nil); err != nil {
-			if derr := b.Destroy(ctx, sandboxID); derr != nil {
+			if derr := cleanup(ctx, sandboxID); derr != nil {
 				b.log.Warn("sandbox: start after provisioning failed and cleanup also failed",
 					"sandbox", spec.Name, "start_err", err, "cleanup_err", derr)
 			}
-			return Handle{}, fmt.Errorf("sandbox create: start after provisioning: %w", err)
+			return Handle{}, fmt.Errorf("sandbox %s: start after provisioning: %w", verb, err)
 		}
 	}
 	// ── end file provisioning ────────────────────────────────────────────────
@@ -399,16 +454,16 @@ func (b *PodmanBackend) Create(ctx context.Context, spec Spec) (Handle, error) {
 	// ── Host-applied egress lockdown (H3/H4) ─────────────────────────────────
 	// For internal-only/filtered, apply the nftables ruleset from the HOST into
 	// the container's netns and then VERIFY it is active.  This is fail-closed:
-	// any failure destroys the container and returns an error so we never run a
+	// any failure removes the container and returns an error so we never run a
 	// sandbox with unconfirmed egress restrictions.
 	if policy == NetworkPolicyInternalOnly || policy == NetworkPolicyFiltered {
 		if err := b.applyHostEgress(ctx, sandboxID, containerID, policy, spec.AllowDomains); err != nil {
 			// Best-effort teardown; surface the original error.
-			if derr := b.Destroy(ctx, sandboxID); derr != nil {
+			if derr := cleanup(ctx, sandboxID); derr != nil {
 				b.log.Warn("sandbox: egress lockdown failed and cleanup also failed",
 					"sandbox", spec.Name, "egress_err", err, "cleanup_err", derr)
 			}
-			return Handle{}, fmt.Errorf("sandbox create: egress lockdown: %w", err)
+			return Handle{}, fmt.Errorf("sandbox %s: egress lockdown: %w", verb, err)
 		}
 	}
 	// ── end host-applied egress ──────────────────────────────────────────────
@@ -420,6 +475,7 @@ func (b *PodmanBackend) Create(ctx context.Context, spec Spec) (Handle, error) {
 
 	b.log.Info("sandbox: container created",
 		"sandbox", spec.Name,
+		"op", verb,
 		"container", containerID,
 		"endpoints", endpoints,
 	)
@@ -609,41 +665,54 @@ func (b *PodmanBackend) Stop(ctx context.Context, id string) error {
 	return nil
 }
 
-// Destroy implements Backend.Destroy.
-// Stops the container (tolerates already-stopped), removes it, then removes
-// the named work volume.
-func (b *PodmanBackend) Destroy(ctx context.Context, id string) error {
+// removeContainer stops and removes the container for id and touches nothing
+// else: it issues no volume command of any kind, so the sandbox's work volume
+// — the caller's data — survives it by construction.  It is the teardown used
+// by Recreate and by every failure path reachable from Recreate.  A missing or
+// already-stopped container is tolerated.
+func (b *PodmanBackend) removeContainer(ctx context.Context, id string) error {
 	if err := validID(id); err != nil {
 		return err
 	}
 	cname := b.containerName(id)
-	vol := b.volumeName(id)
 
 	// Stop — tolerate "already stopped" errors.
 	if _, _, err := b.podman(ctx, []string{"stop", cname}, nil); err != nil {
-		b.log.Debug("sandbox destroy: stop error (may be already stopped)", "id", id, "err", err)
+		b.log.Debug("sandbox remove-container: stop error (may be already stopped)", "id", id, "err", err)
 	}
 
-	// Remove container.  Tolerate a missing container ("no such container") so a
-	// partially-provisioned sandbox still has its named volume reaped below.
+	// Remove container.  Tolerate a missing container ("no such container").
 	if _, _, err := b.podman(ctx, []string{"rm", "--force", cname}, nil); err != nil {
 		if isNotFoundErr(err) {
-			b.log.Debug("sandbox destroy: container not found, continuing to volume rm", "id", id, "err", err)
+			b.log.Debug("sandbox remove-container: container not found", "id", id, "err", err)
 		} else {
-			return fmt.Errorf("sandbox destroy rm %s: %w", id, err)
+			return fmt.Errorf("sandbox remove container %s: %w", id, err)
 		}
 	}
+	return nil
+}
 
-	// Remove work volume.  Tolerate a missing volume.
+// Purge implements Backend.Purge (named Destroy before v0.5.0).
+// Stops the container (tolerates already-stopped), removes it, then removes
+// the named work volume — the caller's data.  This is the only method on the
+// backend that deletes the volume.
+func (b *PodmanBackend) Purge(ctx context.Context, id string) error {
+	if err := b.removeContainer(ctx, id); err != nil {
+		return fmt.Errorf("sandbox purge: %w", err)
+	}
+
+	// Remove work volume.  Tolerate a missing volume so a partially
+	// provisioned sandbox is still fully reaped.
+	vol := b.volumeName(id)
 	if _, _, err := b.podman(ctx, []string{"volume", "rm", "--force", vol}, nil); err != nil {
 		if isNotFoundErr(err) {
-			b.log.Debug("sandbox destroy: volume not found", "id", id, "err", err)
+			b.log.Debug("sandbox purge: volume not found", "id", id, "err", err)
 		} else {
-			return fmt.Errorf("sandbox destroy volume rm %s: %w", id, err)
+			return fmt.Errorf("sandbox purge volume rm %s: %w", id, err)
 		}
 	}
 
-	b.log.Info("sandbox: container destroyed", "sandbox", id)
+	b.log.Info("sandbox: purged (container and work volume removed)", "sandbox", id)
 	return nil
 }
 

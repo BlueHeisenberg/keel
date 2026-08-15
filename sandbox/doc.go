@@ -27,6 +27,23 @@
 // repository, firewall table — is configurable so that a product can brand its
 // own resources without this package knowing the brand.
 //
+// # Data lifetime
+//
+// A sandbox's work volume (its overlay disk, for QEMU) is where the caller's
+// data lives, and exactly one method deletes it: Purge. Recreate replaces the
+// container — new image included — against the existing volume, and is built
+// so the volume-deleting code is not reachable from it; use it for rolling
+// image updates. The split is deliberate after a consumer nearly lost data to
+// the old Destroy, whose name said "infrastructure" and whose effect included
+// "and the data" (it was renamed to Purge in v0.5.0 so migrating callers must
+// decide which operation they meant).
+//
+// The guarantee is mechanical: the volume survives Recreate. Whether the new
+// image can read what the old image wrote is the consumer's compatibility
+// problem — this package owns the mechanism, the consumer owns its schema and
+// any migration between versions of it. Recreate also does no sequencing:
+// rolling sandboxes one at a time is the caller's policy, not this package's.
+//
 // # What reaches the host's process list
 //
 // Everything on a tool's argv is world-readable on the host for as long as the

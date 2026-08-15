@@ -60,6 +60,14 @@ enforce it at all: both `NetworkPolicyFiltered` and `NetworkPolicyInternalOnly` 
 plain user-mode networking. A caller assuming parity between backends is wrong today, so
 choose Podman where egress policy is load-bearing.
 
+**`sandbox` — v0.5.0 renames `Backend.Destroy` to `Purge`**, because it deletes the
+sandbox's work volume — the caller's data. Rolling image updates use the new `Recreate`,
+which replaces the container against the existing volume and structurally cannot delete
+it. On the QEMU backend `Recreate` cannot change the disk image, since an overlay is
+bound to its base; a new base disk requires `Purge` and `Create`, which deletes the data.
+Removing the old name makes migration a compile error rather than a quiet change in what
+a call does.
+
 **`sandbox` — `AllowDomains` pins IP addresses at creation time** via a single lookup.
 DNS rotation silently breaks the allowlist, and a lookup that fails is skipped rather
 than raised.

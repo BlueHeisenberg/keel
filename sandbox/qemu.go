@@ -289,7 +289,7 @@ func (b *QemuBackend) cidFor(id string) uint32 {
 	return b.allocateCID(id)
 }
 
-// freeCID releases the CID allocation for id (called on Destroy).
+// freeCID releases the CID allocation for id (called on Purge).
 func (b *QemuBackend) freeCID(id string) {
 	b.cidMu.Lock()
 	defer b.cidMu.Unlock()
@@ -469,7 +469,7 @@ func (b *QemuBackend) buildQemuArgs(spec Spec, id, overlay string, cid uint32) [
 		"-device", fmt.Sprintf("vhost-vsock-pci,guest-cid=%d", cid),
 		// Headless v1: no GUI; desktop/web endpoints are a follow-up.
 		"-display", "none",
-		// Daemonize so the launch call returns; pidfile lets Inspect/Destroy find it.
+		// Daemonize so the launch call returns; pidfile lets Inspect/Purge find it.
 		"-pidfile", b.pidfilePath(id),
 		"-daemonize",
 	}
@@ -583,10 +583,58 @@ func (b *QemuBackend) qmpReportsRunning(conn qmpConn) bool {
 	return qs.Return.Running
 }
 
-// Destroy implements Backend.Destroy.  Best-effort QMP quit, then removes the
-// per-sandbox state directory (overlay + sockets + pidfile).  A missing VM or
-// directory is tolerated.
-func (b *QemuBackend) Destroy(ctx context.Context, id string) error {
+// Recreate implements Backend.Recreate.  The qemu process is replaced with one
+// launched from spec's resource settings; the per-sandbox overlay disk — where
+// the sandbox's data lives — is preserved, and no path through this method
+// removes the state directory.
+//
+// The disk cannot change here: an overlay is bound to the base image it was
+// created from, so a non-empty spec.Image is rejected with ErrSpecUnsupported.
+// Moving to a new base disk means Purge then Create, which deletes the data —
+// a decision this method refuses to make implicitly.
+func (b *QemuBackend) Recreate(ctx context.Context, spec Spec) (Handle, error) {
+	id := spec.Name
+	if err := validID(id); err != nil {
+		return Handle{}, err
+	}
+	if len(spec.Command) > 0 {
+		return Handle{}, fmt.Errorf("qemu recreate %s: Spec.Command: %w", id, ErrSpecUnsupported)
+	}
+	if len(spec.Files) > 0 {
+		return Handle{}, fmt.Errorf("qemu recreate %s: Spec.Files: %w", id, ErrSpecUnsupported)
+	}
+	if spec.Image != "" {
+		return Handle{}, fmt.Errorf("qemu recreate %s: Spec.Image: %w (an overlay is bound to its base image; a new disk requires Purge and Create, which deletes the data)", id, ErrSpecUnsupported)
+	}
+	overlay := b.overlayPath(id)
+	if _, err := os.Stat(overlay); err != nil {
+		return Handle{}, fmt.Errorf("qemu recreate %s: %w", id, ErrSandboxNotFound)
+	}
+
+	// Stop the running VM (tolerates already-stopped) and confirm it is down
+	// before relaunching against the same overlay: two qemu processes writing
+	// one overlay corrupt it.
+	if err := b.Stop(ctx, id); err != nil {
+		return Handle{}, fmt.Errorf("qemu recreate %s: stop: %w", id, err)
+	}
+	if b.vmRunning(ctx, id) {
+		return Handle{}, fmt.Errorf("qemu recreate %s: VM still running after stop; refusing to launch a second process against the same overlay", id)
+	}
+
+	args := b.buildQemuArgs(spec, id, overlay, b.cidFor(id))
+	if _, _, err := b.run(ctx, args, nil); err != nil {
+		return Handle{}, fmt.Errorf("qemu recreate %s: relaunch: %w", id, err)
+	}
+	b.log.Info("qemu: VM recreated (overlay preserved)", "sandbox", id)
+	return b.refreshedHandle(id), nil
+}
+
+// Purge implements Backend.Purge (named Destroy before v0.5.0).  Best-effort
+// QMP quit, then removes the per-sandbox state directory — overlay, sockets,
+// pidfile.  The overlay is where a QEMU sandbox's data lives, so this is the
+// data-deleting operation; nothing else in this backend removes it.  A missing
+// VM or directory is tolerated.
+func (b *QemuBackend) Purge(ctx context.Context, id string) error {
 	if err := validID(id); err != nil {
 		return err
 	}
@@ -594,14 +642,14 @@ func (b *QemuBackend) Destroy(ctx context.Context, id string) error {
 		_, _ = conn.command("quit", nil)
 		conn.Close()
 	} else {
-		b.log.Debug("qemu destroy: QMP unreachable (may be already stopped)", "id", id, "err", err)
+		b.log.Debug("qemu purge: QMP unreachable (may be already stopped)", "id", id, "err", err)
 	}
 
 	if err := os.RemoveAll(b.sandboxDir(id)); err != nil {
-		return fmt.Errorf("qemu destroy %s: remove state: %w", id, err)
+		return fmt.Errorf("qemu purge %s: remove state: %w", id, err)
 	}
 	b.freeCID(id)
-	b.log.Info("qemu: VM destroyed", "sandbox", id)
+	b.log.Info("qemu: VM purged (state directory and overlay removed)", "sandbox", id)
 	return nil
 }
 

@@ -348,7 +348,9 @@ func TestStop_QMPUnreachable_NoError(t *testing.T) {
 	}
 }
 
-func TestDestroy_QuitAndRemoveState(t *testing.T) {
+// TestPurge_QuitAndRemoveState verifies the explicitly destructive operation:
+// Purge quits the VM and removes the state dir, overlay (the data) included.
+func TestPurge_QuitAndRemoveState(t *testing.T) {
 	r := &mockRunner{}
 	b := newQemuTestBackend(t, r)
 	fq := &fakeQMPDialer{conn: &fakeQMPConn{}}
@@ -364,8 +366,8 @@ func TestDestroy_QuitAndRemoveState(t *testing.T) {
 		t.Fatalf("write overlay: %v", err)
 	}
 
-	if err := b.Destroy(context.Background(), id); err != nil {
-		t.Fatalf("Destroy: %v", err)
+	if err := b.Purge(context.Background(), id); err != nil {
+		t.Fatalf("Purge: %v", err)
 	}
 	if len(fq.conn.cmds) == 0 || fq.conn.cmds[0].cmd != "quit" {
 		t.Errorf("expected quit command, got %+v", fq.conn.cmds)
@@ -770,8 +772,11 @@ func TestCreate_MaliciousID_Rejected(t *testing.T) {
 	if err := b.Stop(context.Background(), "../x"); err == nil {
 		t.Error("Stop expected to reject malicious id")
 	}
-	if err := b.Destroy(context.Background(), "a,b"); err == nil {
-		t.Error("Destroy expected to reject malicious id")
+	if err := b.Purge(context.Background(), "a,b"); err == nil {
+		t.Error("Purge expected to reject malicious id")
+	}
+	if _, err := b.Recreate(context.Background(), Spec{Name: "a,b"}); err == nil {
+		t.Error("Recreate expected to reject malicious id")
 	}
 	if _, err := b.Inspect(context.Background(), "a b"); err == nil {
 		t.Error("Inspect expected to reject malicious id")
@@ -932,5 +937,86 @@ func TestQemuCreate_CommandAndFilesUnsupported(t *testing.T) {
 				t.Error("state dir was created despite the rejected spec")
 			}
 		})
+	}
+}
+
+// ---- Recreate ------------------------------------------------------------------
+
+// TestQemuRecreate_PreservesOverlay verifies the VM process is replaced while
+// the overlay disk — the sandbox's data — survives untouched: no qemu-img call,
+// no state removal, and the relaunch boots the SAME overlay.
+func TestQemuRecreate_PreservesOverlay(t *testing.T) {
+	r := &mockRunner{}
+	b := newQemuTestBackend(t, r)
+
+	id := "vm-roll"
+	if err := os.MkdirAll(b.sandboxDir(id), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	data := []byte("precious-qcow2-bytes")
+	if err := os.WriteFile(b.overlayPath(id), data, 0o644); err != nil {
+		t.Fatalf("write overlay: %v", err)
+	}
+
+	// QMP socket does not exist → Stop treats the VM as already stopped and
+	// vmRunning falls back to the (absent) pidfile.
+	h, err := b.Recreate(context.Background(), Spec{Name: id, MemoryMB: 4096, CPUs: 4})
+	if err != nil {
+		t.Fatalf("Recreate: %v", err)
+	}
+	if h.ID != id {
+		t.Errorf("Handle.ID = %q, want %q", h.ID, id)
+	}
+
+	// Exactly one runner call: the qemu relaunch.  No qemu-img (no new
+	// overlay), and certainly no state removal.
+	if len(r.calls) != 1 {
+		t.Fatalf("expected 1 call (qemu launch), got %d: %v", len(r.calls), r.calls)
+	}
+	launch := r.calls[0]
+	wantDrive := "file=" + b.overlayPath(id) + ",if=virtio"
+	found := false
+	for _, a := range launch.args {
+		if a == wantDrive {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("relaunch must boot the existing overlay %q: %v", wantDrive, launch.args)
+	}
+	// New resources took effect.
+	if !containsArg(launch.args, "4096") || !containsArg(launch.args, "4") {
+		t.Errorf("new resource settings missing from relaunch args: %v", launch.args)
+	}
+	// The overlay file and its contents survived.
+	got, err := os.ReadFile(b.overlayPath(id))
+	if err != nil || string(got) != string(data) {
+		t.Errorf("overlay changed or missing after Recreate: %q, err=%v", got, err)
+	}
+}
+
+// TestQemuRecreate_RejectsImageChange verifies a new disk image cannot arrive
+// through Recreate: an overlay is bound to its base, so the caller must decide
+// between keeping the data (no image change) and Purge+Create (data loss).
+func TestQemuRecreate_RejectsImageChange(t *testing.T) {
+	r := &mockRunner{}
+	b := newQemuTestBackend(t, r)
+	_, err := b.Recreate(context.Background(), Spec{Name: "vm-img", Image: "new-base.qcow2"})
+	if !errors.Is(err, ErrSpecUnsupported) {
+		t.Fatalf("expected ErrSpecUnsupported for image change, got %v", err)
+	}
+	if len(r.calls) != 0 {
+		t.Fatalf("expected zero runner calls, got %d", len(r.calls))
+	}
+}
+
+// TestQemuRecreate_MissingOverlay_NotFound verifies a sandbox with no overlay
+// maps to ErrSandboxNotFound rather than silently creating a fresh disk.
+func TestQemuRecreate_MissingOverlay_NotFound(t *testing.T) {
+	r := &mockRunner{}
+	b := newQemuTestBackend(t, r)
+	_, err := b.Recreate(context.Background(), Spec{Name: "vm-none"})
+	if !errors.Is(err, ErrSandboxNotFound) {
+		t.Fatalf("expected ErrSandboxNotFound, got %v", err)
 	}
 }
