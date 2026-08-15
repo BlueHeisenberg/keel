@@ -50,11 +50,42 @@ type HealthCheck func(context.Context) error
 // with nothing changed on disk.
 type Drain func(context.Context) error
 
-// Consent asks a human whether the update from `from` to `to` may proceed.
-// It is required for a major version bump and for any release flagged
-// SecuritySensitive. Returning false (or any error) means the update is not
-// applied.
-type Consent func(ctx context.Context, from, to Version, notes string) (bool, error)
+// ConsentRequest carries everything a human needs to decide on an update:
+// the version pair, the release notes, and — critically — whether the
+// release is flagged SecuritySensitive, so the consumer can ask "this
+// release changes security-relevant behaviour — approve?" rather than only
+// "there is a new version".
+type ConsentRequest struct {
+	From              Version
+	To                Version
+	Notes             string
+	SecuritySensitive bool
+}
+
+// Decision is a consent hook's answer. The zero value is DecisionUnanswered
+// on purpose: a hook that returns without deciding re-asks next cycle
+// rather than silently approving or permanently suppressing a release.
+type Decision int
+
+const (
+	// DecisionUnanswered: nobody answered (a timed-out question, an
+	// unavailable channel). Not a decision — the update is not applied
+	// now, and the same release is asked about again on the next cycle.
+	DecisionUnanswered Decision = iota
+	// DecisionApproved: a human approved; the update proceeds.
+	DecisionApproved
+	// DecisionDeclined: a human said no. Run remembers the declined
+	// version and does not re-ask until a different version appears.
+	DecisionDeclined
+)
+
+// Consent asks a human whether the update described by req may proceed. It
+// is required for a major version bump and for any release flagged
+// SecuritySensitive. Any error, and any Decision other than
+// DecisionApproved, means the update is not applied; the distinction
+// between DecisionDeclined and DecisionUnanswered controls only whether the
+// question is asked again.
+type Consent func(ctx context.Context, req ConsentRequest) (Decision, error)
 
 // Restart restarts the process after a swap or a rollback: exit and let a
 // supervisor bring the process back up, or re-exec in place. When nil,
@@ -64,14 +95,18 @@ type Restart func(context.Context) error
 
 // Sentinel errors callers must be able to distinguish.
 var (
-	ErrChannelOff       = errors.New("update: updates are disabled (channel off)")
-	ErrConsentRequired  = errors.New("update: release requires consent but no Consent hook is configured")
-	ErrConsentDeclined  = errors.New("update: consent declined")
-	ErrDowngrade        = errors.New("update: refusing to apply a version that is not newer than the running one")
-	ErrNoArtifact       = errors.New("update: release has no artifact for this platform")
-	ErrUpdateInProgress = errors.New("update: an update is already pending; call Resume first")
-	ErrRestartPending   = errors.New("update: binary swapped; restart the process to continue")
-	ErrStale            = errors.New("update: manifest is older than the configured maximum age")
+	ErrChannelOff      = errors.New("update: updates are disabled (channel off)")
+	ErrConsentRequired = errors.New("update: release requires consent but no Consent hook is configured")
+	ErrConsentDeclined = errors.New("update: consent declined")
+	// ErrConsentUnanswered: the consent question got no answer. Silence is
+	// not a decision — the release stays eligible and is asked about again
+	// on the next cycle, unlike ErrConsentDeclined which Run remembers.
+	ErrConsentUnanswered = errors.New("update: consent question unanswered; will ask again")
+	ErrDowngrade         = errors.New("update: refusing to apply a version that is not newer than the running one")
+	ErrNoArtifact        = errors.New("update: release has no artifact for this platform")
+	ErrUpdateInProgress  = errors.New("update: an update is already pending; call Resume first")
+	ErrRestartPending    = errors.New("update: binary swapped; restart the process to continue")
+	ErrStale             = errors.New("update: manifest is older than the configured maximum age")
 	// ErrPreflight: the staged binary could not be executed successfully
 	// before the swap. The update is refused and the running system is left
 	// untouched — a binary that cannot even start would never reach Resume,
@@ -130,9 +165,18 @@ type Config struct {
 	// LockStaleAfter is how old the cross-process lock file may be before
 	// it is presumed abandoned by a crashed updater and broken. Defaults
 	// to 10 minutes. The lock serialises processes sharing one install
-	// path (per-participant pods on one machine); the loser receives
-	// ErrLocked, skips the cycle quietly, and retries on its next check.
+	// path; the loser receives ErrLocked, skips the cycle quietly, and
+	// retries on its next check. The lock is held across the drain, whose
+	// timestamp it refreshes on completion — configure LockStaleAfter
+	// comfortably longer than the worst-case drain.
 	LockStaleAfter time.Duration
+
+	// Now is the clock used for every time-based policy decision: the
+	// stable-channel delay, manifest freshness, lock staleness, and
+	// journal timestamps. Nil means time.Now. It exists so consumers can
+	// test scheduling behaviour against this package rather than around
+	// it; Run's tick interval still elapses in wall-clock time.
+	Now func() time.Time
 
 	HTTPClient *http.Client
 	Logger     *slog.Logger
@@ -258,13 +302,17 @@ func New(cfg Config) (*Updater, error) {
 			target = exe
 		}
 	}
+	now := cfg.Now
+	if now == nil {
+		now = time.Now
+	}
 	return &Updater{
 		cfg:      cfg,
 		current:  current,
 		target:   target,
 		client:   client,
 		log:      logger,
-		now:      time.Now,
+		now:      now,
 		fs:       osFS{},
 		winSwap:  runtime.GOOS == "windows",
 		declined: make(map[string]bool),
@@ -395,12 +443,23 @@ func (u *Updater) Apply(ctx context.Context, rel Release) error {
 		if u.cfg.Consent == nil {
 			return fmt.Errorf("%w (from %s to %s, securitySensitive=%t)", ErrConsentRequired, u.current, to, rel.SecuritySensitive)
 		}
-		granted, err := u.cfg.Consent(ctx, u.current, to, rel.Notes)
+		dec, err := u.cfg.Consent(ctx, ConsentRequest{
+			From:              u.current,
+			To:                to,
+			Notes:             rel.Notes,
+			SecuritySensitive: rel.SecuritySensitive,
+		})
 		if err != nil {
 			return fmt.Errorf("update: consent hook: %w", err)
 		}
-		if !granted {
+		switch dec {
+		case DecisionApproved:
+		case DecisionDeclined:
 			return fmt.Errorf("%w (from %s to %s)", ErrConsentDeclined, u.current, to)
+		default:
+			// DecisionUnanswered, or an unrecognised value: not a decision.
+			// Fail closed for this cycle, stay eligible for the next.
+			return fmt.Errorf("%w (from %s to %s)", ErrConsentUnanswered, u.current, to)
 		}
 	}
 
@@ -428,17 +487,11 @@ func (u *Updater) Apply(ctx context.Context, rel Release) error {
 		}
 	}
 
-	// Drain after preflight: never make participants wait for an update
-	// that was going to be refused anyway.
-	if u.cfg.Drain != nil {
-		if err := u.cfg.Drain(ctx); err != nil {
-			_ = os.Remove(staged)
-			return fmt.Errorf("update: drain before swap: %w", err)
-		}
-	}
-
-	// Cross-process lock: processes sharing this install path serialise
-	// here. The loser removes its own staged download and skips quietly.
+	// Cross-process lock BEFORE the drain: draining silences the household,
+	// so it must only ever happen for an update that is actually going to
+	// proceed. Taking the lock first means a process that loses it skips
+	// quietly WITHOUT having drained anyone. The loser removes its own
+	// staged download and retries next cycle.
 	rel0, lerr := acquireLock(u.target, u.cfg.LockStaleAfter, u.now)
 	if lerr != nil {
 		_ = os.Remove(staged)
@@ -453,11 +506,25 @@ func (u *Updater) Apply(ctx context.Context, rel Release) error {
 	}
 	defer release()
 
-	// Re-check the journal under the lock: another process may have
-	// swapped while this one was downloading.
+	// Re-check the journal under the lock — before draining: another
+	// process may have swapped while this one was downloading, and nobody
+	// should be drained for an update that is already done.
 	if _, err := u.fs.Stat(journalPath(u.target)); err == nil {
 		_ = os.Remove(staged)
 		return ErrUpdateInProgress
+	}
+
+	// Drain while holding the lock. A drain may legitimately take a long
+	// time (waiting for conversations to finish), so refresh the lock's
+	// timestamp afterwards: LockStaleAfter is measured against the last
+	// activity, and consumers must configure it longer than their worst-
+	// case drain.
+	if u.cfg.Drain != nil {
+		if err := u.cfg.Drain(ctx); err != nil {
+			_ = os.Remove(staged)
+			return fmt.Errorf("update: drain before swap: %w", err)
+		}
+		touchLock(u.target, u.now())
 	}
 
 	j := journal{
@@ -733,6 +800,10 @@ func (u *Updater) Run(ctx context.Context) error {
 				case errors.Is(err, ErrConsentDeclined):
 					u.declined[ver] = true
 					u.log.Info("update: declined by consent; will not re-ask for this version", "version", ver)
+				case errors.Is(err, ErrConsentUnanswered):
+					// Silence is not a decision: the release stays eligible
+					// and the question is asked again next cycle.
+					u.log.Info("update: consent question unanswered; will ask again next cycle", "version", ver)
 				case errors.Is(err, ErrLocked), errors.Is(err, ErrUpdateInProgress):
 					// A sibling process is handling it. Nothing is wrong;
 					// skip quietly and look again next cycle.

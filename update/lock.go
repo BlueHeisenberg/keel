@@ -22,6 +22,13 @@ const defaultLockStaleAfter = 10 * time.Minute
 
 func lockPath(target string) string { return target + ".update.lock" }
 
+// touchLock refreshes the lock file's timestamp so the staleness horizon is
+// measured from the holder's last activity rather than from acquisition —
+// used after a long drain, best effort.
+func touchLock(target string, now time.Time) {
+	_ = os.Chtimes(lockPath(target), now, now)
+}
+
 // acquireLock takes the cross-process update lock for target using
 // O_CREATE|O_EXCL, which is atomic on every supported platform. A lock file
 // older than staleAfter is presumed left behind by a crashed process,

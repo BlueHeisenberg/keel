@@ -87,13 +87,28 @@
 //
 // # Cross-process locking
 //
-// Deployments that run several processes off one install path (one pod per
-// participant on the same machine) contend on a lock file beside the
-// target, held across the swap and across Resume. Exactly one process
-// proceeds; the others receive ErrLocked, which means "a sibling is
-// handling it": skip the cycle quietly and retry on the next check —
-// nothing is wrong. A lock left behind by a crashed updater is broken after
-// Config.LockStaleAfter (default 10 minutes).
+// Deployments that run several processes off one shared install path
+// contend on a lock file beside the target, held across the swap and across
+// Resume. Exactly one process proceeds; the others receive ErrLocked, which
+// means "a sibling is handling it": skip the cycle quietly and retry on the
+// next check — nothing is wrong. A lock left behind by a crashed updater is
+// broken after Config.LockStaleAfter (default 10 minutes).
+//
+// The lock is taken BEFORE the drain, deliberately: draining silences the
+// consumer's traffic, so it must only happen for an update that is actually
+// going to proceed. A process that loses the lock therefore skips without
+// having drained anyone. The cost of this ordering is that the lock is held
+// for the duration of the drain — the drain refreshes the lock's timestamp
+// on completion, and Config.LockStaleAfter must be configured comfortably
+// longer than the worst-case drain, or a sibling will break a legitimately
+// held lock mid-drain.
+//
+// What this lock does NOT provide: per-process update sequencing for
+// containerised deployments. A pod built from an image carries a private
+// copy of the binary inside its own image filesystem; pods never share an
+// install path, never contend for this lock, and each one that updates does
+// so independently. Rolling pods one at a time is a property of whoever
+// rolls the image — the supervisor or orchestrator — not of this package.
 //
 // # The swap, exactly
 //

@@ -384,6 +384,11 @@ func TestDrainRunsBeforeRestartAndSwap(t *testing.T) {
 			if data, err := os.ReadFile(e.target); err != nil || !bytes.Equal(data, oldBinary) {
 				t.Errorf("swap ran before drain completed")
 			}
+			// The cross-process lock must already be held: draining is
+			// only allowed for an update that is going to proceed.
+			if !fileExists(lockPath(e.target)) {
+				t.Errorf("drain ran without holding the update lock")
+			}
 			record("drain")
 			return nil
 		}
@@ -425,14 +430,18 @@ func TestMajorVersionRequiresConsent(t *testing.T) {
 	assertTargetUntouched(t, e)
 
 	// Consent declined: refusal, and nothing was downloaded (consent is
-	// asked before any bytes move).
+	// asked before any bytes move). The hook receives the full request:
+	// version pair, notes, and the SecuritySensitive flag.
 	preRequests := e.requests.Load()
 	u := e.updater(func(c *Config) {
-		c.Consent = func(ctx context.Context, from, to Version, notes string) (bool, error) {
-			if from.String() != "v1.0.0" || to.String() != "v2.0.0" || !strings.Contains(notes, "v2.0.0") {
-				t.Errorf("consent args: from=%s to=%s notes=%q", from, to, notes)
+		c.Consent = func(ctx context.Context, req ConsentRequest) (Decision, error) {
+			if req.From.String() != "v1.0.0" || req.To.String() != "v2.0.0" || !strings.Contains(req.Notes, "v2.0.0") {
+				t.Errorf("consent request: %+v", req)
 			}
-			return false, nil
+			if req.SecuritySensitive {
+				t.Errorf("plain major bump reported as security-sensitive")
+			}
+			return DecisionDeclined, nil
 		}
 	})
 	if err := u.Apply(context.Background(), rel); !errors.Is(err, ErrConsentDeclined) {
@@ -443,9 +452,19 @@ func TestMajorVersionRequiresConsent(t *testing.T) {
 	}
 	assertTargetUntouched(t, e)
 
+	// No answer: not a decision — refused this cycle with a distinct
+	// sentinel, nothing changed, and (unlike a decline) still eligible.
+	uu := e.updater(func(c *Config) {
+		c.Consent = func(context.Context, ConsentRequest) (Decision, error) { return DecisionUnanswered, nil }
+	})
+	if err := uu.Apply(context.Background(), rel); !errors.Is(err, ErrConsentUnanswered) {
+		t.Fatalf("unanswered: got %v, want ErrConsentUnanswered", err)
+	}
+	assertTargetUntouched(t, e)
+
 	// Consent granted: the major version applies.
 	u2 := e.updater(func(c *Config) {
-		c.Consent = func(context.Context, Version, Version, string) (bool, error) { return true, nil }
+		c.Consent = func(context.Context, ConsentRequest) (Decision, error) { return DecisionApproved, nil }
 	})
 	if err := u2.Apply(context.Background(), rel); !errors.Is(err, ErrRestartPending) {
 		t.Fatalf("granted: got %v, want ErrRestartPending", err)
@@ -466,11 +485,74 @@ func TestSecuritySensitiveRequiresConsentEvenForPatch(t *testing.T) {
 	}
 	assertTargetUntouched(t, e)
 
+	var sawFlag bool
 	u := e.updater(func(c *Config) {
-		c.Consent = func(context.Context, Version, Version, string) (bool, error) { return false, nil }
+		c.Consent = func(_ context.Context, req ConsentRequest) (Decision, error) {
+			sawFlag = req.SecuritySensitive
+			return DecisionDeclined, nil
+		}
 	})
 	if err := u.Apply(context.Background(), rel); !errors.Is(err, ErrConsentDeclined) {
 		t.Fatalf("security-sensitive declined: got %v, want ErrConsentDeclined", err)
+	}
+	if !sawFlag {
+		t.Error("consent hook was not told the release is security-sensitive; the household cannot be asked the right question")
+	}
+	assertTargetUntouched(t, e)
+}
+
+// TestRunReasksAfterUnansweredConsent: an unanswered Telegram question must
+// not suppress a release forever — Run asks again on the next cycle, and a
+// later answer applies the update. A decline, by contrast, is remembered.
+func TestRunReasksAfterUnansweredConsent(t *testing.T) {
+	e := newEnv(t)
+	rel := e.release("v2.0.0", newBinary, nil)
+	e.serveManifest(rel)
+
+	var asks atomic.Int64
+	u := e.updater(func(c *Config) {
+		c.CheckInterval = 10 * time.Millisecond
+		c.Consent = func(context.Context, ConsentRequest) (Decision, error) {
+			if asks.Add(1) < 3 {
+				return DecisionUnanswered, nil // nobody tapped
+			}
+			return DecisionApproved, nil
+		}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := u.Run(ctx); !errors.Is(err, ErrRestartPending) {
+		t.Fatalf("Run = %v, want ErrRestartPending once consent finally arrives", err)
+	}
+	if n := asks.Load(); n != 3 {
+		t.Fatalf("consent asked %d times, want 3 (re-asked after each non-answer)", n)
+	}
+	got, _ := os.ReadFile(e.target)
+	if !bytes.Equal(got, newBinary) {
+		t.Fatalf("target after eventual approval: %q", got)
+	}
+}
+
+func TestRunRemembersDecline(t *testing.T) {
+	e := newEnv(t)
+	rel := e.release("v2.0.0", newBinary, nil)
+	e.serveManifest(rel)
+
+	var asks atomic.Int64
+	u := e.updater(func(c *Config) {
+		c.CheckInterval = 10 * time.Millisecond
+		c.Consent = func(context.Context, ConsentRequest) (Decision, error) {
+			asks.Add(1)
+			return DecisionDeclined, nil
+		}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	if err := u.Run(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Run = %v, want deadline exceeded (nothing applied)", err)
+	}
+	if n := asks.Load(); n != 1 {
+		t.Fatalf("consent asked %d times after a decline, want exactly 1", n)
 	}
 	assertTargetUntouched(t, e)
 }
@@ -503,12 +585,15 @@ func TestStableChannelLagsByDelay(t *testing.T) {
 	rel := e.release("v1.1.0", newBinary, func(r *Release) { r.PublishedAt = t0 })
 	e.serveManifest(rel)
 
+	// The clock is injected through the public Config seam, not by reaching
+	// into internals: scheduling is testable against the package.
+	now := t0.Add(1 * time.Hour)
 	u := e.updater(func(c *Config) {
 		c.Channel = ChannelStable
 		c.StableDelay = 24 * time.Hour
+		c.Now = func() time.Time { return now }
 	})
 
-	u.now = func() time.Time { return t0.Add(1 * time.Hour) }
 	st, err := u.Check(context.Background())
 	if err != nil {
 		t.Fatalf("Check: %v", err)
@@ -520,7 +605,7 @@ func TestStableChannelLagsByDelay(t *testing.T) {
 		t.Errorf("Reason = %q, want stable delay explanation", st.Reason)
 	}
 
-	u.now = func() time.Time { return t0.Add(25 * time.Hour) }
+	now = t0.Add(25 * time.Hour)
 	st, err = u.Check(context.Background())
 	if err != nil {
 		t.Fatalf("Check: %v", err)

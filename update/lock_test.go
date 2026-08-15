@@ -71,9 +71,16 @@ func TestApplySkipsQuietlyWhenLocked(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := e.updater(nil).Apply(context.Background(), rel)
+	drained := false
+	u := e.updater(func(c *Config) {
+		c.Drain = func(context.Context) error { drained = true; return nil }
+	})
+	err := u.Apply(context.Background(), rel)
 	if !errors.Is(err, ErrLocked) {
 		t.Fatalf("Apply under sibling lock = %v, want ErrLocked", err)
+	}
+	if drained {
+		t.Fatal("losing the lock must never drain: that silences the consumer for an update that will not happen")
 	}
 	got, rerr := os.ReadFile(e.target)
 	if rerr != nil || !bytes.Equal(got, oldBinary) {
