@@ -16,6 +16,64 @@ import (
 // It is neither a [TransportError] nor an [APIError].
 var ErrInvalidRequest = errors.New("llm: invalid request")
 
+// ErrEmptyResponse reports a successful exchange that carried no completion: a
+// 2xx with no choices at all, a choice with neither content nor tool calls, or a
+// stream that reached its end having emitted no text and assembled no tool call.
+//
+// The endpoint answered but produced nothing usable — a reasonable caller treats
+// this as grounds to try another endpoint. It is deliberately neither a
+// [TransportError] (the exchange completed) nor an [APIError] (the status was a
+// success), because it is neither: it is a well-formed answer that says nothing.
+// Reporting it as success is worse than either, since silence from a broken
+// machine is indistinguishable from a model that chose not to speak, and a
+// caller would credit the endpoint for a completion it never produced.
+//
+// # Not every empty answer is a malfunction
+//
+// Before failing over, check the finish reason — from [EmptyResponseError] on
+// either path, or from the [Response] that [Provider.Chat] returns alongside the
+// error. [FinishContentFilter] means the provider declined on purpose, and that
+// decision is final: walking the rest of a fallback chain will get the request
+// refused again at every stop, or answered by whichever machine has the weakest
+// scruples, which is worse than refusing. Any other finish reason on an empty
+// answer is a malfunction, and trying elsewhere is right.
+//
+// Errors that wrap this sentinel are always an [EmptyResponseError], so
+// errors.As reaches the finish reason without parsing an error string.
+var ErrEmptyResponse = errors.New("llm: endpoint produced no completion")
+
+// EmptyResponseError is the concrete error wrapping [ErrEmptyResponse]. It
+// exists so the finish reason survives as data: a caller deciding whether to
+// fail over needs to tell a deliberate refusal from a broken endpoint, and that
+// decision must not depend on matching substrings in an error message.
+type EmptyResponseError struct {
+	// Endpoint is the endpoint that produced nothing, for diagnostics. The API
+	// key is never included.
+	Endpoint string
+
+	// FinishReason is the provider's reported reason for stopping, if it sent
+	// one — compare against [FinishContentFilter] before failing over. Empty
+	// means the provider reported nothing, which is itself a malfunction.
+	FinishReason string
+
+	// Detail names the shape of the emptiness ("no choices", "empty choice",
+	// "empty stream"). It is a fixed classification, never provider text.
+	Detail string
+}
+
+// Error implements error. Like [APIError.Error] it renders only classifiers,
+// never provider prose or caller content.
+func (e *EmptyResponseError) Error() string {
+	msg := fmt.Sprintf("llm: %s produced no completion (%s", e.Endpoint, e.Detail)
+	if e.FinishReason != "" {
+		msg += fmt.Sprintf(", finish_reason %s", e.FinishReason)
+	}
+	return msg + ")"
+}
+
+// Unwrap returns [ErrEmptyResponse] so errors.Is identifies the condition.
+func (e *EmptyResponseError) Unwrap() error { return ErrEmptyResponse }
+
 // TransportError reports that the exchange with the endpoint did not complete:
 // the connection was refused or reset, DNS or TLS failed, the per-call
 // [Endpoint.Timeout] fired, or a stream was cut before it finished.
@@ -53,6 +111,22 @@ func (e *TransportError) Unwrap() error { return e.Err }
 // caller that fails over on them just spends longer arriving at the same result.
 // StatusCode carries the full detail for callers that want to treat, say, 429 or
 // 503 as worth retrying; this package deliberately makes no such policy itself.
+//
+// # What Error does not say
+//
+// Error deliberately omits Message and Body, and reports only the status, the
+// provider's error Type and Code, and the endpoint. This is not tidiness. An
+// error string is the one part of a failure that reaches a log by default,
+// often at the top of a stack nobody is thinking carefully about — and provider
+// error bodies routinely quote the request back, so a 400 can carry the text of
+// whatever somebody just typed. Rendering that into the operator's log by
+// default would make every consumer responsible for scrubbing it, and most
+// would not know they had to.
+//
+// The prose is not lost, only unlisted: read [APIError.Detail], or the Message
+// and Body fields directly. A caller that wants the provider's words has to ask
+// for them by name, at which point disclosing them is a decision rather than an
+// accident.
 type APIError struct {
 	// StatusCode is the HTTP status code.
 	StatusCode int
@@ -81,20 +155,48 @@ type APIError struct {
 	Body string
 }
 
-// Error implements error.
+// Error implements error. It renders the status, the provider's error class and
+// code, and the endpoint — never the provider's prose. See the type
+// documentation for why, and [APIError.Detail] for how to get the prose.
 func (e *APIError) Error() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "llm: %s returned %d", e.Endpoint, e.StatusCode)
-	switch {
-	case e.Message != "":
-		fmt.Fprintf(&b, ": %s", e.Message)
-	case e.Body != "":
-		fmt.Fprintf(&b, ": %s", e.Body)
+	b.WriteString("llm: ")
+	b.WriteString(e.Endpoint)
+	b.WriteString(" returned ")
+	if e.Status != "" {
+		b.WriteString(e.Status)
+	} else {
+		fmt.Fprintf(&b, "%d", e.StatusCode)
 	}
-	if e.Code != "" {
+
+	switch {
+	case e.Type != "" && e.Code != "":
+		fmt.Fprintf(&b, " (type %s, code %s)", e.Type, e.Code)
+	case e.Type != "":
+		fmt.Fprintf(&b, " (type %s)", e.Type)
+	case e.Code != "":
 		fmt.Fprintf(&b, " (code %s)", e.Code)
 	}
 	return b.String()
+}
+
+// Detail returns the provider's own description of the failure: the parsed
+// Message, the raw Body, or both when the body carries more than the message.
+//
+// It is a method rather than part of Error so that disclosing it is a decision.
+// The text is whatever the provider chose to send, which for a rejected request
+// frequently includes the request itself — prompt text, tool arguments, an
+// entire message. Treat the result as caller content, not as diagnostics: log it
+// where content is allowed to go, or not at all.
+func (e *APIError) Detail() string {
+	switch {
+	case e.Message == "":
+		return e.Body
+	case e.Body == "" || strings.Contains(e.Body, e.Message):
+		return e.Message
+	default:
+		return e.Message + ": " + e.Body
+	}
 }
 
 // IsTransport reports whether err was caused by a failure to exchange bytes

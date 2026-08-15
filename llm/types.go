@@ -57,6 +57,28 @@ const (
 	RoleTool = "tool"
 )
 
+// The reasons a completion can stop, as reported by the provider in
+// finish_reason. Providers invent their own values, so the raw string is always
+// preserved in [Response.FinishReason] and [Chunk.FinishReason]; these constants
+// name the four that are common to every OpenAI-compatible server.
+//
+// The distinction that matters most is [FinishContentFilter] against the rest.
+// A content filter is the provider refusing on purpose, and it is final: the
+// same request sent to another endpoint gets refused again, or worse, gets
+// answered by a machine with weaker scruples. Every other empty result is a
+// malfunction, and trying elsewhere is the right response. See [ErrEmptyResponse].
+const (
+	// FinishStop is a completion that ended normally.
+	FinishStop = "stop"
+	// FinishLength is a completion cut short by the token limit.
+	FinishLength = "length"
+	// FinishToolCalls is a turn that ended because the model requested tools.
+	FinishToolCalls = "tool_calls"
+	// FinishContentFilter is the provider declining to answer. It is a decision,
+	// not a fault, and it will not be different somewhere else.
+	FinishContentFilter = "content_filter"
+)
+
 // ChatMessage is one message in a conversation, in the OpenAI wire format.
 //
 // An assistant message that requests tools populates ToolCalls. A message
@@ -177,6 +199,12 @@ type Chunk struct {
 	// ToolCalls are the fully assembled tool invocations, attached to the Done
 	// chunk.
 	ToolCalls []ToolCall `json:"toolCalls,omitempty"`
+
+	// FinishReason is the provider's reason for stopping, attached to the Done
+	// chunk — one of [FinishStop], [FinishLength], [FinishToolCalls],
+	// [FinishContentFilter], or whatever else the provider chose to send. Empty
+	// means it reported none.
+	FinishReason string `json:"finishReason,omitempty"`
 }
 
 // Response is a complete non-streaming completion.
@@ -187,8 +215,9 @@ type Response struct {
 	// ToolCalls are the tool invocations the model requested, if any.
 	ToolCalls []ToolCall `json:"toolCalls,omitempty"`
 
-	// FinishReason is the provider's reason for stopping — "stop", "length",
-	// "tool_calls" — or empty if it reported none.
+	// FinishReason is the provider's reason for stopping — one of [FinishStop],
+	// [FinishLength], [FinishToolCalls], [FinishContentFilter], or whatever else
+	// the provider chose to send. Empty means it reported none.
 	FinishReason string `json:"finishReason,omitempty"`
 
 	// TokensIn and TokensOut are the prompt and completion token counts

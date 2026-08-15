@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -23,8 +24,21 @@ type Provider interface {
 	// Chat sends req to ep and waits for the whole completion.
 	//
 	// It returns a [TransportError] if the exchange did not complete, an
-	// [APIError] if the endpoint answered non-2xx, and an error wrapping
-	// [ErrInvalidRequest] if the request could not be built at all.
+	// [APIError] if the endpoint answered non-2xx, an error wrapping
+	// [ErrInvalidRequest] if the request could not be built at all, and an
+	// [EmptyResponseError] if the answer was a success carrying no content and
+	// no tool calls.
+	//
+	// On [ErrEmptyResponse] — and only then — the returned Response is
+	// deliberately populated rather than zeroed, against the usual Go shape.
+	// FinishReason and the token counts are exactly what a caller needs to tell
+	// a provider that declined on purpose from an endpoint that is broken, and
+	// those two warrant opposite responses: a [FinishContentFilter] is final and
+	// re-asking elsewhere only finds a machine with weaker scruples, whereas any
+	// other empty answer is grounds to try another endpoint. Discarding that
+	// signal to honour a convention would make the convention cost more than it
+	// is worth. Content and ToolCalls are empty by definition. Every other error
+	// returns a zero Response, as usual.
 	Chat(ctx context.Context, ep Endpoint, req ChatReq) (Response, error)
 
 	// ChatStream sends req to ep with streaming enabled and emits every text
@@ -34,10 +48,72 @@ type Provider interface {
 	// It does NOT close out: the caller owns that channel and may be
 	// multiplexing several streams onto it. Sends respect ctx, so a cancelled
 	// context unblocks a stalled send rather than leaking the goroutine. On
-	// error, no Done chunk is emitted and the error is returned — the same three
-	// kinds as Chat.
+	// error, no Done chunk is emitted and the error is returned — the same kinds
+	// as Chat.
+	//
+	// A stream that ends having emitted no text and assembled no tool call is an
+	// [EmptyResponseError], not a success: nothing is sent to out and the error
+	// is returned instead. Since nothing was forwarded, failing over is safe —
+	// but read the finish reason first, because [FinishContentFilter] is a
+	// deliberate refusal and re-asking elsewhere is the wrong response to it.
+	//
+	// A caller that fails over between endpoints wants [ChatStreamReader]
+	// instead: this signature commits the caller's channel before the endpoint
+	// has accepted the request, which puts the failover decision on the wrong
+	// side of the first token.
 	ChatStream(ctx context.Context, ep Endpoint, req ChatReq, out chan<- Chunk) error
+
+	// ChatStreamReader sends req to ep with streaming enabled and returns the
+	// stream for the caller to pull, rather than pushing into a channel.
+	//
+	// The split is where the protocol puts it, and it is the whole point of this
+	// entry point: the returned error covers everything up to and including
+	// response-header validation — building the request, connecting, TLS, the
+	// status line — so a caller holding several endpoints may safely fail over
+	// on it. Nothing has been emitted yet and nobody downstream has seen a
+	// partial answer.
+	//
+	// Any error from [Stream.Next], by contrast, means output has already begun,
+	// and failing over is NOT safe: retrying a started response against another
+	// endpoint produces spliced or duplicated output. That rule is deliberately
+	// conservative — a caller that tracks whether it has forwarded anything yet
+	// can do better on a stream that failed before its first chunk — but the
+	// safe default is to surface the failure rather than retry it.
+	//
+	// The one carve-out is [ErrEmptyResponse], which Next returns in place of a
+	// terminal chunk when the stream produced nothing at all. That one IS safe
+	// to fail over on, by construction: it can only arise when no chunk was ever
+	// handed back, so there is no partial output to splice.
+	//
+	// The caller must Close the returned stream.
+	ChatStreamReader(ctx context.Context, ep Endpoint, req ChatReq) (Stream, error)
 }
+
+// Stream is an in-progress streamed completion, pulled one chunk at a time.
+// It is not safe for concurrent use.
+type Stream interface {
+	// Next returns the next chunk. Text deltas arrive first, then exactly one
+	// chunk with Done set carrying the assembled tool calls, token counts and
+	// finish reason; after that Next returns io.EOF.
+	//
+	// An [EmptyResponseError] replaces the terminal chunk when the stream
+	// produced nothing usable, and is the one error here that is safe to fail
+	// over on. Any other error means the stream failed mid-answer — see
+	// [Provider.ChatStreamReader] for why that is not a failover signal.
+	//
+	// Errors are sticky: once Next has failed it keeps returning the same error.
+	Next() (Chunk, error)
+
+	// Close releases the underlying connection. It is idempotent and safe to
+	// call at any point, including on a stream that is only partly read: an
+	// abandoned stream is aborted rather than drained, so Close never waits on
+	// a provider that is still sending. After Close, Next returns
+	// [ErrStreamClosed].
+	Close() error
+}
+
+// ErrStreamClosed is returned by [Stream.Next] after the stream has been closed.
+var ErrStreamClosed = errors.New("llm: stream closed")
 
 // DefaultResponseHeaderTimeout bounds how long the default client waits for an
 // endpoint to begin answering. It is the knob that matters for failover: a
@@ -125,27 +201,283 @@ func (p *httpProvider) Chat(ctx context.Context, ep Endpoint, req ChatReq) (Resp
 		out.TokensIn = parsed.Usage.PromptTokens
 		out.TokensOut = parsed.Usage.CompletionTokens
 	}
-	if len(parsed.Choices) > 0 {
-		choice := parsed.Choices[0]
-		out.Content = choice.Message.Content
-		out.FinishReason = choice.FinishReason
-		out.ToolCalls = p.normalizeToolCalls(ctx, choice.Message.ToolCalls)
+
+	if len(parsed.Choices) == 0 {
+		return out, &EmptyResponseError{Endpoint: endpointLabel(ep), Detail: "no choices"}
+	}
+
+	choice := parsed.Choices[0]
+	out.Content = choice.Message.Content
+	out.FinishReason = choice.FinishReason
+	out.ToolCalls = p.normalizeToolCalls(ctx, choice.Message.ToolCalls)
+
+	if out.Content == "" && len(out.ToolCalls) == 0 {
+		return out, &EmptyResponseError{
+			Endpoint:     endpointLabel(ep),
+			FinishReason: choice.FinishReason,
+			Detail:       "empty choice",
+		}
 	}
 	return out, nil
 }
 
-// ChatStream implements [Provider].
+// ChatStream implements [Provider]. It is [ChatStreamReader] with the pulling
+// done for the caller.
 func (p *httpProvider) ChatStream(ctx context.Context, ep Endpoint, req ChatReq, out chan<- Chunk) error {
-	callCtx, cancel := withTimeout(ctx, ep.Timeout)
-	defer cancel()
-
-	resp, err := p.send(ctx, callCtx, ep, req, true)
+	stream, err := p.openStream(ctx, ep, req)
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer stream.Close()
 
-	return p.parseSSE(ctx, callCtx, ep, resp.Body, out)
+	for {
+		chunk, err := stream.Next()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+		if err := p.emit(stream.parent, stream.callCtx, ep, out, chunk); err != nil {
+			return err
+		}
+		if chunk.Done {
+			return nil
+		}
+	}
+}
+
+// ChatStreamReader implements [Provider].
+func (p *httpProvider) ChatStreamReader(ctx context.Context, ep Endpoint, req ChatReq) (Stream, error) {
+	stream, err := p.openStream(ctx, ep, req)
+	if err != nil {
+		return nil, err
+	}
+	return stream, nil
+}
+
+// openStream performs the request and returns the stream positioned just after
+// response-header validation — the boundary a failing-over caller needs.
+func (p *httpProvider) openStream(ctx context.Context, ep Endpoint, req ChatReq) (*httpStream, error) {
+	// Always derive a cancellable context, even without Endpoint.Timeout, so
+	// that Close can abort a request the caller has walked away from.
+	callCtx, cancel := streamContext(ctx, ep.Timeout)
+
+	resp, err := p.send(ctx, callCtx, ep, req, true)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, sseScannerInitial), sseScannerMax)
+
+	return &httpStream{
+		provider: p,
+		parent:   ctx,
+		callCtx:  callCtx,
+		cancel:   cancel,
+		endpoint: ep,
+		body:     resp.Body,
+		scanner:  scanner,
+	}, nil
+}
+
+// httpStream is the net/http-backed [Stream]. It spawns no goroutines: Next
+// reads the connection synchronously, so abandoning a stream leaks nothing once
+// Close has cancelled the request.
+type httpStream struct {
+	provider *httpProvider
+	parent   context.Context
+	callCtx  context.Context
+	cancel   context.CancelFunc
+	endpoint Endpoint
+	body     io.ReadCloser
+	scanner  *bufio.Scanner
+
+	// toolAccum accumulates in-progress tool calls by stream index. A slice is
+	// enough: indices arrive in order and gaps are uncommon.
+	toolAccum []*toolAccumEntry
+
+	// lastUsage holds the most recent usage payload seen, attached to the Done
+	// chunk so the caller can budget tokens.
+	lastUsage *openAIUsage
+
+	// finishReason holds the last non-empty finish_reason seen on the stream. It
+	// is what lets an empty stream be told apart from a deliberate refusal.
+	finishReason string
+
+	// produced records whether any text delta has been handed to the caller. It
+	// decides whether the end of the stream is a completion or an
+	// [ErrEmptyResponse], and it must stay false until a delta actually leaves
+	// Next — an empty stream is only safe to fail over on because nothing was
+	// forwarded.
+	produced bool
+
+	finished bool
+	closed   bool
+	err      error
+}
+
+var _ Stream = (*httpStream)(nil)
+
+// ensureIndex grows the accumulator to cover idx, refusing indices beyond
+// maxToolCallIndex so a buggy or hostile provider cannot exhaust memory.
+func (s *httpStream) ensureIndex(idx int) bool {
+	if idx < 0 || idx > maxToolCallIndex {
+		return false
+	}
+	for len(s.toolAccum) <= idx {
+		s.toolAccum = append(s.toolAccum, &toolAccumEntry{})
+	}
+	return true
+}
+
+// fail records a sticky stream failure and classifies it.
+func (s *httpStream) fail(err error) error {
+	s.err = s.provider.transportErr(s.parent, "stream", s.endpoint, err)
+	return s.err
+}
+
+// finish handles the end of the stream, from either the [DONE] sentinel or a
+// clean close. It returns the terminal chunk, or an [EmptyResponseError] when
+// the stream delivered no text and assembled no tool call — the same defect the
+// blocking path reports, arriving by a different route.
+func (s *httpStream) finish() (Chunk, error) {
+	s.finished = true
+
+	done := Chunk{Done: true, FinishReason: s.finishReason}
+	if len(s.toolAccum) > 0 {
+		done.ToolCalls = s.provider.assembleToolCalls(s.parent, s.toolAccum)
+	}
+	if s.lastUsage != nil {
+		done.TokensIn = s.lastUsage.PromptTokens
+		done.TokensOut = s.lastUsage.CompletionTokens
+	}
+
+	if !s.produced && len(done.ToolCalls) == 0 {
+		// Nothing was ever handed to the caller, so nothing downstream has seen
+		// a partial answer and failing over remains safe. Report rather than
+		// deliver a terminal chunk that would look like a completed turn.
+		s.err = &EmptyResponseError{
+			Endpoint:     endpointLabel(s.endpoint),
+			FinishReason: s.finishReason,
+			Detail:       "empty stream",
+		}
+		return Chunk{}, s.err
+	}
+	return done, nil
+}
+
+// Next implements [Stream].
+//
+// A malformed event is logged and skipped rather than ending the stream: one bad
+// frame out of a thousand should cost a token, not the whole turn.
+func (s *httpStream) Next() (Chunk, error) {
+	switch {
+	case s.closed:
+		return Chunk{}, ErrStreamClosed
+	case s.err != nil:
+		return Chunk{}, s.err
+	case s.finished:
+		return Chunk{}, io.EOF
+	}
+
+	log := s.provider.logger
+	for s.scanner.Scan() {
+		if err := s.callCtx.Err(); err != nil {
+			return Chunk{}, s.fail(err)
+		}
+
+		line := s.scanner.Text()
+
+		// Skip blank lines and comments. Some providers send ": keep-alive".
+		if line == "" || strings.HasPrefix(line, ":") {
+			continue
+		}
+		if !strings.HasPrefix(line, "data:") {
+			// Field lines other than data (event:, id:, retry:) carry nothing
+			// this protocol uses.
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+
+		if payload == "[DONE]" {
+			return s.finish()
+		}
+
+		var event openAIStreamEvent
+		if err := json.Unmarshal([]byte(payload), &event); err != nil {
+			log.WarnContext(s.parent, "llm: skipping unparseable stream event",
+				"endpoint", endpointLabel(s.endpoint), "err", err)
+			continue
+		}
+
+		if event.Usage != nil {
+			s.lastUsage = event.Usage
+		}
+		if len(event.Choices) == 0 {
+			continue
+		}
+		choice := event.Choices[0]
+		if choice.FinishReason != "" {
+			s.finishReason = choice.FinishReason
+		}
+
+		for _, tc := range choice.Delta.ToolCalls {
+			if !s.ensureIndex(tc.Index) {
+				log.WarnContext(s.parent, "llm: ignoring out-of-range tool_call index",
+					"endpoint", endpointLabel(s.endpoint), "index", tc.Index)
+				continue
+			}
+			entry := s.toolAccum[tc.Index]
+			if tc.ID != "" {
+				entry.id = tc.ID
+			}
+			if tc.Type != "" {
+				entry.callType = tc.Type
+			}
+			if tc.Function.Name != "" {
+				entry.name = tc.Function.Name
+			}
+			if tc.Function.Arguments != "" {
+				entry.arguments.WriteString(tc.Function.Arguments)
+			}
+		}
+
+		if delta := choice.Delta.Content; delta != "" {
+			s.produced = true
+			return Chunk{Delta: delta}, nil
+		}
+	}
+
+	if err := s.scanner.Err(); err != nil {
+		return Chunk{}, s.fail(err)
+	}
+
+	// The stream ended without a [DONE] sentinel. Providers vary on whether they
+	// send one; a clean close is still a complete answer.
+	return s.finish()
+}
+
+// Close implements [Stream].
+func (s *httpStream) Close() error {
+	if s.closed {
+		return nil
+	}
+	s.closed = true
+
+	// Cancel first: it aborts a read that is still waiting on the provider, so
+	// closing a half-read stream returns immediately instead of blocking on a
+	// body that may never end.
+	s.cancel()
+
+	err := s.body.Close()
+	if err != nil && errors.Is(err, context.Canceled) {
+		// Our own cancellation, not a failure worth reporting.
+		return nil
+	}
+	return err
 }
 
 // send builds and performs the request and validates the status. parent is the
@@ -248,6 +580,16 @@ func withTimeout(ctx context.Context, d time.Duration) (context.Context, context
 	return context.WithTimeout(ctx, d)
 }
 
+// streamContext is withTimeout for a stream, where the derived context must
+// always be cancellable: a stream outlives the call that opened it, and Close
+// needs something to pull to abort a request still in flight.
+func streamContext(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	if d <= 0 {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, d)
+}
+
 // transportErr classifies a failed exchange. If the caller's own context is
 // already done, that is the honest cause and it is returned as-is so
 // errors.Is(err, context.Canceled) holds — a caller that hung up has not learned
@@ -331,108 +673,6 @@ const (
 	sseScannerMax     = 1024 * 1024
 )
 
-// parseSSE reads the event stream and emits chunks to out until the [DONE]
-// sentinel, the end of the stream, or a cancelled context. It does not close out.
-//
-// A malformed event is logged and skipped rather than aborting the stream: one
-// bad frame out of a thousand should cost a token, not the whole turn.
-func (p *httpProvider) parseSSE(parent, callCtx context.Context, ep Endpoint, r io.Reader, out chan<- Chunk) error {
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, sseScannerInitial), sseScannerMax)
-
-	// toolAccum accumulates in-progress tool calls by stream index. A slice is
-	// enough: indices arrive in order and gaps are uncommon.
-	var toolAccum []*toolAccumEntry
-
-	// lastUsage holds the most recent usage payload seen, attached to the Done
-	// chunk so the caller can budget tokens.
-	var lastUsage *openAIUsage
-
-	ensureIndex := func(idx int) bool {
-		if idx < 0 || idx > maxToolCallIndex {
-			return false
-		}
-		for len(toolAccum) <= idx {
-			toolAccum = append(toolAccum, &toolAccumEntry{})
-		}
-		return true
-	}
-
-	for scanner.Scan() {
-		if err := callCtx.Err(); err != nil {
-			return p.transportErr(parent, "stream", ep, err)
-		}
-
-		line := scanner.Text()
-
-		// Skip blank lines and comments. Some providers send ": keep-alive".
-		if line == "" || strings.HasPrefix(line, ":") {
-			continue
-		}
-		if !strings.HasPrefix(line, "data:") {
-			// Field lines other than data (event:, id:, retry:) carry nothing
-			// this protocol uses.
-			continue
-		}
-		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-
-		if payload == "[DONE]" {
-			return p.emit(parent, callCtx, ep, out, p.buildDoneChunk(parent, toolAccum, lastUsage))
-		}
-
-		var event openAIStreamEvent
-		if err := json.Unmarshal([]byte(payload), &event); err != nil {
-			p.logger.WarnContext(parent, "llm: skipping unparseable stream event",
-				"endpoint", endpointLabel(ep), "err", err)
-			continue
-		}
-
-		if event.Usage != nil {
-			lastUsage = event.Usage
-		}
-		if len(event.Choices) == 0 {
-			continue
-		}
-		choice := event.Choices[0]
-
-		for _, tc := range choice.Delta.ToolCalls {
-			if !ensureIndex(tc.Index) {
-				p.logger.WarnContext(parent, "llm: ignoring out-of-range tool_call index",
-					"endpoint", endpointLabel(ep), "index", tc.Index)
-				continue
-			}
-			entry := toolAccum[tc.Index]
-			if tc.ID != "" {
-				entry.id = tc.ID
-			}
-			if tc.Type != "" {
-				entry.callType = tc.Type
-			}
-			if tc.Function.Name != "" {
-				entry.name = tc.Function.Name
-			}
-			if tc.Function.Arguments != "" {
-				entry.arguments.WriteString(tc.Function.Arguments)
-			}
-		}
-
-		if delta := choice.Delta.Content; delta != "" {
-			if err := p.emit(parent, callCtx, ep, out, Chunk{Delta: delta}); err != nil {
-				return err
-			}
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		return p.transportErr(parent, "stream", ep, err)
-	}
-
-	// The stream ended without a [DONE] sentinel. Providers vary on whether they
-	// send one; a clean close is still a complete answer, so emit the terminal
-	// chunk and let the caller finish normally.
-	return p.emit(parent, callCtx, ep, out, p.buildDoneChunk(parent, toolAccum, lastUsage))
-}
-
 // emit sends one chunk, giving up if the call is cancelled so a caller that
 // stops reading cannot wedge the send forever.
 func (p *httpProvider) emit(parent, callCtx context.Context, ep Endpoint, out chan<- Chunk, c Chunk) error {
@@ -442,20 +682,6 @@ func (p *httpProvider) emit(parent, callCtx context.Context, ep Endpoint, out ch
 	case <-callCtx.Done():
 		return p.transportErr(parent, "stream", ep, callCtx.Err())
 	}
-}
-
-// buildDoneChunk constructs the terminal chunk, attaching the assembled tool
-// calls and the reported token usage.
-func (p *httpProvider) buildDoneChunk(ctx context.Context, toolAccum []*toolAccumEntry, usage *openAIUsage) Chunk {
-	done := Chunk{Done: true}
-	if len(toolAccum) > 0 {
-		done.ToolCalls = p.assembleToolCalls(ctx, toolAccum)
-	}
-	if usage != nil {
-		done.TokensIn = usage.PromptTokens
-		done.TokensOut = usage.CompletionTokens
-	}
-	return done
 }
 
 // assembleToolCalls turns accumulated fragments into tool calls. Entries with no

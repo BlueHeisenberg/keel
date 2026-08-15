@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -464,10 +465,129 @@ func TestChat_Success(t *testing.T) {
 	}
 }
 
-// TestChat_EmptyChoices checks that a response with no choices is not a panic.
-func TestChat_EmptyChoices(t *testing.T) {
+// TestChat_EmptyResponse checks that a 2xx carrying nothing usable is reported
+// as a failure rather than as a completion that happened to be silent. A caller
+// that took it for success would credit a broken endpoint with an answer and
+// show a member an empty reply.
+func TestChat_EmptyResponse(t *testing.T) {
+	cases := []struct {
+		name       string
+		body       string
+		wantFinish string
+		wantDetail string
+	}{
+		{
+			name:       "no choices",
+			body:       `{"choices":[]}`,
+			wantDetail: "no choices",
+		},
+		{
+			name:       "choices absent entirely",
+			body:       `{}`,
+			wantDetail: "no choices",
+		},
+		{
+			name:       "choice with neither content nor tool calls",
+			body:       `{"choices":[{"message":{"content":""},"finish_reason":"content_filter"}],"usage":{"prompt_tokens":9,"completion_tokens":0}}`,
+			wantFinish: llm.FinishContentFilter,
+			wantDetail: "empty choice",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				fmt.Fprint(w, c.body)
+			}))
+			defer srv.Close()
+
+			resp, err := quietProvider(t).Chat(context.Background(),
+				llm.Endpoint{BaseURL: srv.URL, Label: "silent-box"}, llm.ChatReq{})
+			if err == nil {
+				t.Fatalf("Chat succeeded with %+v, want ErrEmptyResponse", resp)
+			}
+			if !errors.Is(err, llm.ErrEmptyResponse) {
+				t.Errorf("errors.Is(%v, ErrEmptyResponse) = false, want true", err)
+			}
+			// The endpoint answered, so neither of the two transport/provider
+			// classifications applies.
+			if llm.IsTransport(err) || llm.IsAPI(err) {
+				t.Error("an empty completion is neither a transport nor a provider failure")
+			}
+			if !strings.Contains(err.Error(), "silent-box") {
+				t.Errorf("error %q should name the endpoint", err.Error())
+			}
+
+			// The finish reason must be reachable as data, not by reading the
+			// error text: it decides whether failing over is right.
+			var emptyErr *llm.EmptyResponseError
+			if !errors.As(err, &emptyErr) {
+				t.Fatalf("errors.As(*EmptyResponseError) failed for %T", err)
+			}
+			if emptyErr.FinishReason != c.wantFinish {
+				t.Errorf("FinishReason = %q, want %q", emptyErr.FinishReason, c.wantFinish)
+			}
+			if emptyErr.Detail != c.wantDetail {
+				t.Errorf("Detail = %q, want %q", emptyErr.Detail, c.wantDetail)
+			}
+
+			// And the Response comes back populated — the deliberate exception
+			// to the usual Go shape, for exactly the same reason.
+			if resp.FinishReason != c.wantFinish {
+				t.Errorf("Response.FinishReason = %q, want %q", resp.FinishReason, c.wantFinish)
+			}
+			if resp.Content != "" || len(resp.ToolCalls) != 0 {
+				t.Errorf("Response should carry no completion, got %+v", resp)
+			}
+		})
+	}
+}
+
+// TestChat_EmptyResponseKeepsUsage checks the specific reason the Response is
+// returned alongside the error: a router must be able to tell a deliberate
+// refusal from a broken endpoint, and the usage counts still describe real work.
+func TestChat_EmptyResponseKeepsUsage(t *testing.T) {
+	const body = `{"choices":[{"message":{"content":""},"finish_reason":"content_filter"}],"usage":{"prompt_tokens":9,"completion_tokens":0}}`
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `{"choices":[]}`)
+		fmt.Fprint(w, body)
+	}))
+	defer srv.Close()
+
+	resp, err := quietProvider(t).Chat(context.Background(), llm.Endpoint{BaseURL: srv.URL}, llm.ChatReq{})
+	if !errors.Is(err, llm.ErrEmptyResponse) {
+		t.Fatalf("Chat error = %v, want ErrEmptyResponse", err)
+	}
+	if resp.FinishReason != llm.FinishContentFilter {
+		t.Errorf("FinishReason = %q, want %q", resp.FinishReason, llm.FinishContentFilter)
+	}
+	if resp.TokensIn != 9 {
+		t.Errorf("TokensIn = %d, want 9", resp.TokensIn)
+	}
+}
+
+// TestFinishReasonConstants pins the constants to the wire vocabulary, so a
+// caller comparing against them is comparing against what providers send.
+func TestFinishReasonConstants(t *testing.T) {
+	want := map[string]string{
+		llm.FinishStop:          "stop",
+		llm.FinishLength:        "length",
+		llm.FinishToolCalls:     "tool_calls",
+		llm.FinishContentFilter: "content_filter",
+	}
+	for got, expected := range want {
+		if got != expected {
+			t.Errorf("finish reason constant = %q, want %q", got, expected)
+		}
+	}
+}
+
+// TestChat_ToolCallsOnlyIsNotEmpty checks the boundary of the emptiness rule: a
+// tool-call turn legitimately carries no text, and must not be mistaken for a
+// broken response.
+func TestChat_ToolCallsOnlyIsNotEmpty(t *testing.T) {
+	const body = `{"choices":[{"message":{"content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"probe","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, body)
 	}))
 	defer srv.Close()
 
@@ -475,8 +595,8 @@ func TestChat_EmptyChoices(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Chat: %v", err)
 	}
-	if resp.Content != "" || len(resp.ToolCalls) != 0 {
-		t.Errorf("empty choices produced %+v, want zero Response", resp)
+	if len(resp.ToolCalls) != 1 {
+		t.Fatalf("got %d tool calls, want 1", len(resp.ToolCalls))
 	}
 }
 
@@ -529,6 +649,96 @@ func TestAPIError_BadRequest(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "sk-noop") {
 		t.Error("API key leaked into the error message")
+	}
+}
+
+// TestAPIError_ErrorDoesNotDiscloseContent is the leak guard. Provider 400
+// bodies quote the rejected request back, so anything Error() renders by default
+// ends up in an operator's log — including whatever a member just typed. The
+// prose must be reachable only by asking for it.
+func TestAPIError_ErrorDoesNotDiscloseContent(t *testing.T) {
+	// A body shaped like a real provider rejection that echoes the request.
+	const secret = "my private message about the dentist appointment"
+	errBody := fmt.Sprintf(
+		`{"error":{"message":"Invalid 'messages[0].content': %s","type":"invalid_request_error","code":"string_above_max_length"}}`,
+		secret)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, errBody)
+	}))
+	defer srv.Close()
+
+	_, err := quietProvider(t).Chat(context.Background(),
+		llm.Endpoint{BaseURL: srv.URL, Label: "provider-a"}, llm.ChatReq{})
+	if err == nil {
+		t.Fatal("Chat succeeded on a 400")
+	}
+
+	rendered := err.Error()
+	if strings.Contains(rendered, secret) {
+		t.Errorf("Error() disclosed echoed request content: %q", rendered)
+	}
+
+	var apiErr *llm.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("errors.As(*APIError) failed for %T", err)
+	}
+	if strings.Contains(apiErr.Error(), apiErr.Message) {
+		t.Error("Error() must not render the provider Message")
+	}
+	if strings.Contains(apiErr.Error(), apiErr.Body) {
+		t.Error("Error() must not render the raw Body")
+	}
+
+	// What Error() must still carry: enough to act on without reading content.
+	for _, want := range []string{"provider-a", "400", "invalid_request_error", "string_above_max_length"} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("Error() = %q, missing %q", rendered, want)
+		}
+	}
+
+	// And the prose remains available to a caller that asks by name.
+	if !strings.Contains(apiErr.Detail(), secret) {
+		t.Errorf("Detail() = %q, want the provider's message", apiErr.Detail())
+	}
+}
+
+// TestAPIError_Detail checks the shapes Detail collapses: message alone, body
+// alone, and the two combined only when the body carries more.
+func TestAPIError_Detail(t *testing.T) {
+	cases := []struct {
+		name   string
+		apiErr llm.APIError
+		want   string
+	}{
+		{
+			name:   "message parsed out of the body",
+			apiErr: llm.APIError{Message: "bad model", Body: `{"error":{"message":"bad model"}}`},
+			want:   "bad model",
+		},
+		{
+			name:   "body only",
+			apiErr: llm.APIError{Body: "<html>502</html>"},
+			want:   "<html>502</html>",
+		},
+		{
+			name:   "message and an unrelated body",
+			apiErr: llm.APIError{Message: "bad model", Body: "upstream detail"},
+			want:   "bad model: upstream detail",
+		},
+		{
+			name:   "neither",
+			apiErr: llm.APIError{},
+			want:   "",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := c.apiErr.Detail(); got != c.want {
+				t.Errorf("Detail() = %q, want %q", got, c.want)
+			}
+		})
 	}
 }
 
@@ -863,6 +1073,377 @@ func TestAPIKeyNeverLogged(t *testing.T) {
 	}
 	if strings.Contains(logs.String(), secret) {
 		t.Errorf("API key leaked into logs: %s", logs.String())
+	}
+}
+
+// --- pull-based streaming ----------------------------------------------------
+
+// TestChatStreamReader_PullsChunks checks the pull contract: deltas first, then
+// one terminal chunk, then io.EOF, and io.EOF again on every call after that.
+func TestChatStreamReader_PullsChunks(t *testing.T) {
+	srv, _ := sseServer(t, cannedSSE([]string{"one", "two"}))
+
+	ep := llm.Endpoint{BaseURL: srv.URL, Model: "m"}
+	stream, err := quietProvider(t).ChatStreamReader(context.Background(), ep, llm.ChatReq{})
+	if err != nil {
+		t.Fatalf("ChatStreamReader: %v", err)
+	}
+	defer stream.Close()
+
+	var deltas []string
+	var sawDone bool
+	for {
+		chunk, err := stream.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Next: %v", err)
+		}
+		if chunk.Done {
+			sawDone = true
+			continue
+		}
+		deltas = append(deltas, chunk.Delta)
+	}
+
+	if got := strings.Join(deltas, ""); got != "onetwo" {
+		t.Errorf("deltas = %q, want %q", got, "onetwo")
+	}
+	if !sawDone {
+		t.Error("no terminal chunk before io.EOF")
+	}
+	if _, err := stream.Next(); !errors.Is(err, io.EOF) {
+		t.Errorf("Next after EOF = %v, want io.EOF", err)
+	}
+}
+
+// TestChatStreamReader_FailoverBoundary is the reason this entry point exists:
+// everything up to and including response-header validation must surface as the
+// returned error, with no stream handed back and nothing emitted, so a caller
+// holding several endpoints can move on without having leaked a partial answer.
+func TestChatStreamReader_FailoverBoundary(t *testing.T) {
+	t.Run("provider refusal", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprint(w, `{"error":{"message":"bad model","type":"invalid_request_error"}}`)
+		}))
+		defer srv.Close()
+
+		stream, err := quietProvider(t).ChatStreamReader(context.Background(),
+			llm.Endpoint{BaseURL: srv.URL, Model: "m"}, llm.ChatReq{})
+		if err == nil {
+			t.Fatal("ChatStreamReader succeeded on a 400")
+		}
+		if stream != nil {
+			t.Error("a failed open must not hand back a stream")
+		}
+		if !llm.IsAPI(err) || llm.IsTransport(err) {
+			t.Errorf("classification wrong for a 400: %v", err)
+		}
+	})
+
+	t.Run("unreachable endpoint", func(t *testing.T) {
+		dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+		deadURL := dead.URL
+		dead.Close()
+
+		stream, err := quietProvider(t).ChatStreamReader(context.Background(),
+			llm.Endpoint{BaseURL: deadURL, Model: "m"}, llm.ChatReq{})
+		if err == nil {
+			t.Fatal("ChatStreamReader succeeded against a closed port")
+		}
+		if stream != nil {
+			t.Error("a failed open must not hand back a stream")
+		}
+		if !llm.IsTransport(err) {
+			t.Errorf("IsTransport(%v) = false, want true", err)
+		}
+	})
+}
+
+// TestChatStreamReader_ErrorIsSticky checks that a mid-stream failure is
+// reported identically on every subsequent call, so a caller cannot accidentally
+// read past it.
+func TestChatStreamReader_ErrorIsSticky(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			t.Error("test server does not support hijacking")
+			return
+		}
+		conn, buf, err := hijacker.Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		defer conn.Close()
+
+		buf.WriteString("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n")
+		frame := `data: {"choices":[{"delta":{"content":"partial"}}]}` + "\n\n"
+		fmt.Fprintf(buf, "%x\r\n%s\r\n", len(frame), frame)
+		writeFlush(t, buf)
+	}))
+	defer srv.Close()
+
+	stream, err := quietProvider(t).ChatStreamReader(context.Background(),
+		llm.Endpoint{BaseURL: srv.URL, Model: "m"}, llm.ChatReq{})
+	if err != nil {
+		t.Fatalf("ChatStreamReader: %v", err)
+	}
+	defer stream.Close()
+
+	if chunk, err := stream.Next(); err != nil || chunk.Delta != "partial" {
+		t.Fatalf("first Next = (%+v, %v), want the partial delta", chunk, err)
+	}
+
+	first, err := stream.Next()
+	if err == nil {
+		t.Fatalf("second Next succeeded with %+v, want the severed stream reported", first)
+	}
+	if !llm.IsTransport(err) {
+		t.Errorf("IsTransport(%v) = false, want true", err)
+	}
+	if _, again := stream.Next(); again != err {
+		t.Errorf("Next after failure = %v, want the same sticky error %v", again, err)
+	}
+}
+
+// TestChatStreamReader_CloseReleasesConnection checks that abandoning a stream
+// half-read costs nothing: Close must abort the request rather than leave it
+// running, so neither the connection nor a goroutine survives it.
+func TestChatStreamReader_CloseReleasesConnection(t *testing.T) {
+	released := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(released)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("test server does not support flushing")
+			return
+		}
+		// Stream indefinitely: only an aborted request ends this handler.
+		for {
+			if r.Context().Err() != nil {
+				return
+			}
+			if _, err := fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"tick"}}]}`+"\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
+			time.Sleep(5 * time.Millisecond)
+		}
+	}))
+	defer srv.Close()
+
+	// An injected client so the test can retire idle connections deterministically.
+	client := &http.Client{Transport: &http.Transport{}}
+	provider := llm.New(llm.Options{
+		Client: client,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+
+	baseline := runtime.NumGoroutine()
+
+	stream, err := provider.ChatStreamReader(context.Background(),
+		llm.Endpoint{BaseURL: srv.URL, Model: "m"}, llm.ChatReq{})
+	if err != nil {
+		t.Fatalf("ChatStreamReader: %v", err)
+	}
+
+	chunk, err := stream.Next()
+	if err != nil {
+		t.Fatalf("Next: %v", err)
+	}
+	if chunk.Delta != "tick" {
+		t.Fatalf("Delta = %q, want tick", chunk.Delta)
+	}
+
+	// Close mid-body, with the provider still sending.
+	if err := stream.Close(); err != nil {
+		t.Errorf("Close: %v", err)
+	}
+	if err := stream.Close(); err != nil {
+		t.Errorf("second Close: %v, want idempotent nil", err)
+	}
+	if _, err := stream.Next(); !errors.Is(err, llm.ErrStreamClosed) {
+		t.Errorf("Next after Close = %v, want ErrStreamClosed", err)
+	}
+
+	select {
+	case <-released:
+	case <-time.After(10 * time.Second):
+		t.Fatal("server still streaming after Close: the request was abandoned, not aborted")
+	}
+
+	client.CloseIdleConnections()
+
+	// Goroutine counts settle asynchronously; poll rather than sample once.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		got := runtime.NumGoroutine()
+		if got <= baseline+2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Errorf("goroutines %d -> %d across an abandoned stream, want no growth", baseline, got)
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestChatStream_EmptyStream checks that the streaming path reports the same
+// defect as the blocking one. A stream that ends having produced no text and no
+// tool call must not deliver a terminal chunk: that would look downstream like a
+// completed turn, and would credit a broken endpoint with an answer.
+func TestChatStream_EmptyStream(t *testing.T) {
+	cases := []struct {
+		name       string
+		body       string
+		wantFinish string
+	}{
+		{
+			name: "sentinel only",
+			body: "data: [DONE]\n\n",
+		},
+		{
+			name: "clean close with no events",
+			body: "",
+		},
+		{
+			name:       "finish reason but no content",
+			body:       `data: {"choices":[{"delta":{},"finish_reason":"content_filter"}]}` + "\n\ndata: [DONE]\n\n",
+			wantFinish: llm.FinishContentFilter,
+		},
+		{
+			name:       "empty deltas only",
+			body:       `data: {"choices":[{"delta":{"content":""},"finish_reason":"stop"}]}` + "\n\ndata: [DONE]\n\n",
+			wantFinish: llm.FinishStop,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			srv, _ := sseServer(t, c.body)
+
+			out := make(chan llm.Chunk, 8)
+			ep := llm.Endpoint{BaseURL: srv.URL, Model: "m", Label: "silent-box"}
+			err := quietProvider(t).ChatStream(context.Background(), ep, llm.ChatReq{}, out)
+
+			if err == nil {
+				t.Fatal("ChatStream reported success for a stream that produced nothing")
+			}
+			if !errors.Is(err, llm.ErrEmptyResponse) {
+				t.Errorf("errors.Is(%v, ErrEmptyResponse) = false, want true", err)
+			}
+			if llm.IsTransport(err) || llm.IsAPI(err) {
+				t.Error("an empty stream is neither a transport nor a provider failure")
+			}
+
+			// Nothing may have reached the caller: that is what makes failing
+			// over safe here.
+			if len(out) != 0 {
+				t.Errorf("%d chunks were emitted before the empty-stream error, want 0", len(out))
+			}
+
+			var emptyErr *llm.EmptyResponseError
+			if !errors.As(err, &emptyErr) {
+				t.Fatalf("errors.As(*EmptyResponseError) failed for %T", err)
+			}
+			if emptyErr.FinishReason != c.wantFinish {
+				t.Errorf("FinishReason = %q, want %q", emptyErr.FinishReason, c.wantFinish)
+			}
+			if emptyErr.Detail != "empty stream" {
+				t.Errorf("Detail = %q, want %q", emptyErr.Detail, "empty stream")
+			}
+		})
+	}
+}
+
+// TestChatStream_ToolCallOnlyStreamIsNotEmpty checks the boundary: a turn that
+// requests a tool and says nothing is a real completion, not an empty one.
+func TestChatStream_ToolCallOnlyStreamIsNotEmpty(t *testing.T) {
+	srv, _ := sseServer(t, cannedToolCallSSE("call_1", "probe", []string{`{}`}))
+
+	out := make(chan llm.Chunk, 8)
+	wait := startCollector(out)
+
+	ep := llm.Endpoint{BaseURL: srv.URL, Model: "m"}
+	if err := quietProvider(t).ChatStream(context.Background(), ep, llm.ChatReq{}, out); err != nil {
+		t.Fatalf("ChatStream: %v", err)
+	}
+
+	done := doneChunk(t, wait())
+	if len(done.ToolCalls) != 1 {
+		t.Fatalf("got %d tool calls, want 1", len(done.ToolCalls))
+	}
+	if done.FinishReason != llm.FinishToolCalls {
+		t.Errorf("Done.FinishReason = %q, want %q", done.FinishReason, llm.FinishToolCalls)
+	}
+}
+
+// TestChatStream_DoneChunkCarriesFinishReason checks that the reason a normal
+// completion stopped survives onto the terminal chunk, testable against the
+// constants rather than a literal.
+func TestChatStream_DoneChunkCarriesFinishReason(t *testing.T) {
+	body := `data: {"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}` + "\n\n" +
+		`data: {"choices":[{"delta":{},"finish_reason":"length"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+	srv, _ := sseServer(t, body)
+
+	out := make(chan llm.Chunk, 8)
+	wait := startCollector(out)
+
+	ep := llm.Endpoint{BaseURL: srv.URL, Model: "m"}
+	if err := quietProvider(t).ChatStream(context.Background(), ep, llm.ChatReq{}, out); err != nil {
+		t.Fatalf("ChatStream: %v", err)
+	}
+
+	if done := doneChunk(t, wait()); done.FinishReason != llm.FinishLength {
+		t.Errorf("Done.FinishReason = %q, want %q", done.FinishReason, llm.FinishLength)
+	}
+}
+
+// TestChatStreamReader_EmptyStreamIsSafeToFailOver checks the pull path's
+// version: Next returns the empty-response error in place of a terminal chunk,
+// having handed back nothing at all, and it stays sticky afterwards.
+func TestChatStreamReader_EmptyStreamIsSafeToFailOver(t *testing.T) {
+	body := `data: {"choices":[{"delta":{},"finish_reason":"content_filter"}]}` + "\n\ndata: [DONE]\n\n"
+	srv, _ := sseServer(t, body)
+
+	ep := llm.Endpoint{BaseURL: srv.URL, Model: "m", Label: "filtered-box"}
+	stream, err := quietProvider(t).ChatStreamReader(context.Background(), ep, llm.ChatReq{})
+	if err != nil {
+		t.Fatalf("ChatStreamReader: %v", err)
+	}
+	defer stream.Close()
+
+	chunk, err := stream.Next()
+	if err == nil {
+		t.Fatalf("first Next returned %+v, want ErrEmptyResponse", chunk)
+	}
+	if !errors.Is(err, llm.ErrEmptyResponse) {
+		t.Errorf("errors.Is(%v, ErrEmptyResponse) = false, want true", err)
+	}
+	if chunk.Done {
+		t.Error("a terminal chunk was handed back alongside the empty-stream error")
+	}
+
+	var emptyErr *llm.EmptyResponseError
+	if !errors.As(err, &emptyErr) {
+		t.Fatalf("errors.As(*EmptyResponseError) failed for %T", err)
+	}
+	if emptyErr.FinishReason != llm.FinishContentFilter {
+		t.Errorf("FinishReason = %q, want %q", emptyErr.FinishReason, llm.FinishContentFilter)
+	}
+	if !strings.Contains(err.Error(), "filtered-box") {
+		t.Errorf("error %q should name the endpoint", err.Error())
+	}
+
+	if _, again := stream.Next(); again != err {
+		t.Errorf("Next after the empty-stream error = %v, want the same sticky error", again)
 	}
 }
 
