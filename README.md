@@ -38,12 +38,16 @@ ambiguity, so it stays renamed.
 | `sandbox` | Process isolation with pluggable backends (Podman, QEMU) behind one `Backend` interface. Linux hosts |
 | `vault` | Passphrase-sealed secret storage with argon2-derived keys. Persistence is an interface the caller supplies |
 | `llm` | OpenAI-compatible provider client: completions, streaming, sanitisation |
-| `update` | Signed, atomic, self-rolling-back binary updates |
+| `update` | Self-updating binaries: signed manifests verified against multiple trusted keys, a preflight run of the staged binary before it is swapped in, an atomic swap with automatic rollback, a cross-process lock, channels including `off`, and an exported signing surface (`SignPayload`, `Envelope`, `ParseEnvelope`, `VerifyPayload`, `SignerIDs`, `ManifestSchema`) for release tooling |
 | `ids` | Identifier generation |
-| `log` | `slog` helpers |
+| `log` | `slog` helpers, including secret redaction |
 
 Dependencies are kept near zero by design — a module you import into everything must
-not drag a tree behind it.
+not drag a tree behind it. As of v0.2.0 that is two direct dependencies,
+`golang.org/x/crypto` (Argon2id, in `vault`) and `golang.org/x/sys` (vsock and
+signal handling, in `sandbox`), both from the Go team and each used narrowly. A CI
+dependency budget checks `go.mod` stays tidy and reports the direct dependency list
+on every build, so a new one can't be added silently.
 
 ## Known limitations
 
@@ -63,8 +67,9 @@ than raised.
 **`sandbox` — QEMU guest context IDs are allocated per-process and in-memory.** Two
 backend instances, or a restart, can hand the same CID to different sandboxes.
 
-**`sandbox` — liveness detection is Linux-only in practice.** Off Linux, a dead VM is
-reported as running, because `os.FindProcess` succeeds for any pid.
+**`sandbox` — liveness detection is Linux-only in practice.** Off Linux, QEMU's
+pidfile liveness check degrades to assuming the VM is still running; only the Linux
+path does a real check, probing the recorded pid with signal 0.
 
 **`vault` — AAD is anti-confusion, not authorization.** An open vault will decrypt any
 record whose AAD the caller supplies. The confused-deputy hole is closed only if callers
@@ -84,11 +89,25 @@ try.
 **`vault` — there is no DEK rotation.** `Rotate` changes the passphrase, not the data
 key. A leaked data key means re-sealing everything.
 
+## Versions
+
+**v0.1.0** — first release. All six packages extracted from the-harness, where
+they were built and tested against real Podman, real QEMU and real providers;
+extraction preserved the test suites, so if a package is here, its tests came
+with it. `update` landed already hardened: signed manifests, preflight, atomic
+swap with rollback, and cross-process locking.
+
+**v0.2.0** — `update` gained an exported signing surface (`SignPayload`,
+`Envelope`, `ParseEnvelope`, `VerifyPayload`, `SignerIDs`, `ManifestSchema`) so
+release tooling can add a signature to an existing manifest, including for key
+rotation, without re-encoding or invalidating the signatures already on it. CI
+now enforces the dependency budget on every build.
+
 ## Status
 
-Early. Packages are being extracted from the-harness, where they were built and
-tested against real Podman, real QEMU and real providers. Extraction preserves the
-test suites; if a package is here, its tests came with it.
+Extraction from the-harness is complete: every package in the table above has
+been pulled out, hardened on its own, and released. That does not make the
+module finished — it makes it a foundation other things can now be built on.
 
 The API is not stable before `v1.0.0`.
 
