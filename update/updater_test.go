@@ -61,7 +61,7 @@ func newEnv(t *testing.T) *env {
 }
 
 // artifact registers an endpoint serving `served` and returns an Artifact
-// whose signed digest is that of `digestOf` — pass different slices to model
+// whose signed digest is that of `digestOf` â€” pass different slices to model
 // an artifact host serving something other than what was signed.
 func (e *env) artifact(served, digestOf []byte) Artifact {
 	path := fmt.Sprintf("/artifact-%d", e.nextArt.Add(1))
@@ -91,7 +91,7 @@ func (e *env) release(version string, artifact []byte, mut func(*Release)) Relea
 func (e *env) serveManifest(rel Release, signers ...Signer) {
 	e.t.Helper()
 	m := Manifest{
-		Schema:      manifestSchema,
+		Schema:      ManifestSchema,
 		GeneratedAt: time.Now().UTC(),
 		Channels:    map[string]Release{"edge": rel, "stable": rel},
 	}
@@ -187,7 +187,7 @@ func TestCheckRejectsTamperedManifest(t *testing.T) {
 	e := newEnv(t)
 	e.serveManifest(e.release("v1.1.0", newBinary, nil))
 	data, _ := e.manifest.Load().([]byte)
-	var env2 envelope
+	var env2 Envelope
 	if err := json.Unmarshal(data, &env2); err != nil {
 		t.Fatal(err)
 	}
@@ -214,7 +214,7 @@ func TestCheckRejectsWrongKey(t *testing.T) {
 func TestCheckRejectsUnsignedManifest(t *testing.T) {
 	e := newEnv(t)
 	raw, err := json.Marshal(Manifest{
-		Schema:   manifestSchema,
+		Schema:   ManifestSchema,
 		Channels: map[string]Release{"edge": e.release("v1.1.0", newBinary, nil)},
 	})
 	if err != nil {
@@ -551,7 +551,7 @@ func TestStaleManifestRejected(t *testing.T) {
 	e := newEnv(t)
 	rel := e.release("v1.1.0", newBinary, nil)
 	m := Manifest{
-		Schema:      manifestSchema,
+		Schema:      ManifestSchema,
 		GeneratedAt: time.Now().Add(-48 * time.Hour).UTC(),
 		Channels:    map[string]Release{"edge": rel, "stable": rel},
 	}

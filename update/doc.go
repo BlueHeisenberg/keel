@@ -46,7 +46,11 @@
 // this package can compensate for a leaked signing key. Multiple trusted
 // public keys are supported so that keys can be rotated: ship a build
 // trusting both the old and new key, start signing with the new key, then
-// drop the old key in a later release.
+// drop the old key in a later release. Release tooling adds the new
+// signature by parsing the published envelope and signing its original
+// payload bytes (ParseEnvelope, SignPayload, Envelope.Encode) — the payload
+// is never re-encoded, so the existing signature stays valid for any
+// manifest any producer ever wrote.
 //
 // Note for consumers: Config.MaxManifestAge defaults to OFF, so replay of
 // an old, correctly-signed manifest is unbounded by default (it can never

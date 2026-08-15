@@ -23,7 +23,7 @@ func genKey(t *testing.T) (ed25519.PublicKey, ed25519.PrivateKey) {
 
 func testManifest() Manifest {
 	return Manifest{
-		Schema:      manifestSchema,
+		Schema:      ManifestSchema,
 		GeneratedAt: time.Now().UTC(),
 		Channels: map[string]Release{
 			"edge": {
@@ -58,7 +58,7 @@ func TestVerifyRejectsTamperedPayload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SignManifest: %v", err)
 	}
-	var env envelope
+	var env Envelope
 	if err := json.Unmarshal(data, &env); err != nil {
 		t.Fatalf("unmarshal envelope: %v", err)
 	}
@@ -115,7 +115,7 @@ func TestVerifyRejectsUnsigned(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	env, err := json.Marshal(envelope{Payload: payload})
+	env, err := json.Marshal(Envelope{Payload: payload})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,9 +130,9 @@ func TestVerifyRejectsMalformedSignature(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	env, err := json.Marshal(envelope{
+	env, err := json.Marshal(Envelope{
 		Payload:    payload,
-		Signatures: []envelopeSignature{{KeyID: "k1", Sig: []byte("too short")}},
+		Signatures: []Signature{{KeyID: "k1", Sig: []byte("too short")}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -150,6 +150,157 @@ func TestVerifyRejectsNoTrustedKeys(t *testing.T) {
 	}
 	if _, err := VerifyManifest(data, nil); !errors.Is(err, ErrSignature) {
 		t.Fatalf("no trusted keys: got %v, want ErrSignature", err)
+	}
+}
+
+func TestSignPayloadVerifyPayload(t *testing.T) {
+	pub, priv := genKey(t)
+	otherPub, _ := genKey(t)
+	payload := []byte(`{"exact":"bytes, never re-encoded"}`)
+
+	sig, err := SignPayload(payload, priv, "k1")
+	if err != nil {
+		t.Fatalf("SignPayload: %v", err)
+	}
+	if sig.KeyID != "k1" || len(sig.Sig) != ed25519.SignatureSize {
+		t.Fatalf("signature shape wrong: %+v", sig)
+	}
+	if !VerifyPayload(payload, sig, pub) {
+		t.Fatal("signature does not verify under the signing key")
+	}
+	if VerifyPayload(payload, sig, otherPub) {
+		t.Fatal("signature verifies under an unrelated key")
+	}
+	tampered := append([]byte{'x'}, payload...)
+	if VerifyPayload(tampered, sig, pub) {
+		t.Fatal("signature verifies over different bytes")
+	}
+	if _, err := SignPayload(nil, priv, "k1"); err == nil {
+		t.Fatal("SignPayload accepted an empty payload")
+	}
+	if _, err := SignPayload(payload, []byte("short"), "k1"); err == nil {
+		t.Fatal("SignPayload accepted a malformed private key")
+	}
+}
+
+// TestAddSignatureToForeignEnvelope is the rotation-safety test: the payload
+// is deliberately formatted in a way Go's JSON encoder would never produce
+// (indentation, unusual key ordering, stray whitespace). A second signature
+// is added by parsing the envelope and signing the original bytes — never by
+// re-encoding a decoded manifest — and both signatures must remain valid.
+// If this passes, rotation works for any manifest anyone can produce, not
+// only for manifests this codebase happened to write.
+func TestAddSignatureToForeignEnvelope(t *testing.T) {
+	pub1, priv1 := genKey(t)
+	pub2, priv2 := genKey(t)
+
+	payload := []byte("{\n\t\"channels\": {\"edge\": {\"artifacts\": {\"linux/amd64\": {\"sha256\": \"00\",   \"url\": \"https://example.invalid/a\"}}, \"version\": \"v1.1.0\"}},\n    \"generatedAt\": \"2026-08-15T00:00:00Z\",\n\t\"schema\": 1   \n}\n")
+
+	// Prove the payload does NOT round-trip through Go's encoder: this is
+	// what makes the test mean something.
+	var decoded Manifest
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		t.Fatalf("test payload is not valid manifest JSON: %v", err)
+	}
+	reencoded, err := json.Marshal(decoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(reencoded, payload) {
+		t.Fatal("test payload round-trips byte-for-byte; it does not exercise the foreign-producer case")
+	}
+
+	// Release 1: signed by the original key, by some external tool.
+	sig1, err := SignPayload(payload, priv1, "2026-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	envBytes, err := Envelope{Payload: payload, Signatures: []Signature{sig1}}.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Rotation: a later invocation parses the published envelope and adds a
+	// signature from the new key, without touching the payload.
+	parsed, err := ParseEnvelope(envBytes)
+	if err != nil {
+		t.Fatalf("ParseEnvelope: %v", err)
+	}
+	if !bytes.Equal(parsed.Payload, payload) {
+		t.Fatal("ParseEnvelope did not preserve the payload bytes verbatim")
+	}
+	sig2, err := SignPayload(parsed.Payload, priv2, "2026-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed.Signatures = append(parsed.Signatures, sig2)
+	rotated, err := parsed.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Round-trip once more and confirm the payload still survived verbatim.
+	reparsed, err := ParseEnvelope(rotated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(reparsed.Payload, payload) {
+		t.Fatal("Encode re-encoded the payload; existing signatures would be invalidated")
+	}
+
+	// Both signatures verify independently: a deployment trusting only the
+	// old key and one trusting only the new key both accept the rotated
+	// envelope.
+	for name, key := range map[string]ed25519.PublicKey{"old key only": pub1, "new key only": pub2} {
+		m, err := VerifyManifest(rotated, []ed25519.PublicKey{key})
+		if err != nil {
+			t.Fatalf("VerifyManifest (%s): %v", name, err)
+		}
+		if m.Channels["edge"].Version != "v1.1.0" {
+			t.Fatalf("decoded manifest wrong (%s): %+v", name, m)
+		}
+	}
+}
+
+func TestSignerIDs(t *testing.T) {
+	_, priv1 := genKey(t)
+	_, priv2 := genKey(t)
+	payload := []byte(`{"schema":1}`)
+	sig1, err := SignPayload(payload, priv1, "2026-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig2, err := SignPayload(payload, priv2, "2026-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := Envelope{Payload: payload, Signatures: []Signature{sig1, sig2}}
+	data, err := env.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParseEnvelope(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := parsed.SignerIDs()
+	if len(ids) != 2 || ids[0] != "2026-a" || ids[1] != "2026-b" {
+		t.Fatalf("SignerIDs = %v, want [2026-a 2026-b] in order", ids)
+	}
+}
+
+func TestParseEnvelopeStructuralChecks(t *testing.T) {
+	if _, err := ParseEnvelope([]byte("not json")); err == nil {
+		t.Error("ParseEnvelope accepted non-JSON")
+	}
+	if _, err := ParseEnvelope([]byte(`{"signatures":[]}`)); err == nil {
+		t.Error("ParseEnvelope accepted an empty payload")
+	}
+	if _, err := ParseEnvelope([]byte(`{"payload":"AAAA","signatures":[{"keyId":"k","signature":"AAAA"}]}`)); err == nil {
+		t.Error("ParseEnvelope accepted a malformed (wrong-length) signature")
+	}
+	if _, err := (Envelope{}).Encode(); err == nil {
+		t.Error("Encode accepted an empty payload")
 	}
 }
 
