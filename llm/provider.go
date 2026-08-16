@@ -27,7 +27,9 @@ type Provider interface {
 	// [APIError] if the endpoint answered non-2xx, an error wrapping
 	// [ErrInvalidRequest] if the request could not be built at all, and an
 	// [EmptyResponseError] if the answer was a success carrying no content and
-	// no tool calls.
+	// no tool calls — including the case where a reasoning model spent the turn
+	// thinking and answered nothing, which arrives with the trace in
+	// [EmptyResponseError.Reasoning] and must not be failed over on.
 	//
 	// On [ErrEmptyResponse] — and only then — the returned Response is
 	// deliberately populated rather than zeroed, against the usual Go shape.
@@ -51,11 +53,16 @@ type Provider interface {
 	// error, no Done chunk is emitted and the error is returned — the same kinds
 	// as Chat.
 	//
+	// Reasoning deltas are accumulated rather than emitted, and arrive whole on
+	// the Done chunk: a thinking trace is not part of the answer and must not
+	// appear inside it.
+	//
 	// A stream that ends having emitted no text and assembled no tool call is an
 	// [EmptyResponseError], not a success: nothing is sent to out and the error
 	// is returned instead. Since nothing was forwarded, failing over is safe —
-	// but read the finish reason first, because [FinishContentFilter] is a
-	// deliberate refusal and re-asking elsewhere is the wrong response to it.
+	// but read the error first, because neither [FinishContentFilter] (a
+	// deliberate refusal) nor a non-empty [EmptyResponseError.Reasoning] (a model
+	// that only thought) gets better at another endpoint.
 	//
 	// A caller that fails over between endpoints wants [ChatStreamReader]
 	// instead: this signature commits the caller's channel before the endpoint
@@ -81,9 +88,11 @@ type Provider interface {
 	// safe default is to surface the failure rather than retry it.
 	//
 	// The one carve-out is [ErrEmptyResponse], which Next returns in place of a
-	// terminal chunk when the stream produced nothing at all. That one IS safe
-	// to fail over on, by construction: it can only arise when no chunk was ever
-	// handed back, so there is no partial output to splice.
+	// terminal chunk when the stream produced nothing at all. That one is safe
+	// to fail over on as far as splicing goes, by construction: it can only
+	// arise when no chunk was ever handed back, so there is no partial output to
+	// splice. Whether it is worth failing over is a separate question the error
+	// answers — see [ErrEmptyResponse].
 	//
 	// The caller must Close the returned stream.
 	ChatStreamReader(ctx context.Context, ep Endpoint, req ChatReq) (Stream, error)
@@ -208,6 +217,7 @@ func (p *httpProvider) Chat(ctx context.Context, ep Endpoint, req ChatReq) (Resp
 
 	choice := parsed.Choices[0]
 	out.Content = choice.Message.Content
+	out.Reasoning = choice.Message.text()
 	out.FinishReason = choice.FinishReason
 	out.ToolCalls = p.normalizeToolCalls(ctx, choice.Message.ToolCalls)
 
@@ -215,10 +225,22 @@ func (p *httpProvider) Chat(ctx context.Context, ep Endpoint, req ChatReq) (Resp
 		return out, &EmptyResponseError{
 			Endpoint:     endpointLabel(ep),
 			FinishReason: choice.FinishReason,
-			Detail:       "empty choice",
+			Detail:       emptyDetail(out.Reasoning, "empty choice"),
+			Reasoning:    out.Reasoning,
 		}
 	}
 	return out, nil
+}
+
+// emptyDetail classifies an empty answer. A model that produced a reasoning
+// trace and no content is a different fault from an endpoint that produced
+// nothing at all, and the distinction is worth having in the log line as well as
+// in the error's fields.
+func emptyDetail(reasoning, otherwise string) string {
+	if reasoning != "" {
+		return DetailReasoningOnly
+	}
+	return otherwise
 }
 
 // ChatStream implements [Provider]. It is [ChatStreamReader] with the pulling
@@ -307,6 +329,14 @@ type httpStream struct {
 	// is what lets an empty stream be told apart from a deliberate refusal.
 	finishReason string
 
+	// reasoning accumulates the model's thinking trace. It is deliberately NOT
+	// forwarded as it arrives: a reasoning delta is not part of the answer, and
+	// emitting it as one would put chain-of-thought into whatever the caller is
+	// printing. It reaches the caller whole, on the Done chunk or on the
+	// EmptyResponseError, which is also what keeps produced false — a stream of
+	// nothing but reasoning has forwarded nothing and stays safe to fail over on.
+	reasoning strings.Builder
+
 	// produced records whether any text delta has been handed to the caller. It
 	// decides whether the end of the stream is a completion or an
 	// [ErrEmptyResponse], and it must stay false until a delta actually leaves
@@ -346,7 +376,7 @@ func (s *httpStream) fail(err error) error {
 func (s *httpStream) finish() (Chunk, error) {
 	s.finished = true
 
-	done := Chunk{Done: true, FinishReason: s.finishReason}
+	done := Chunk{Done: true, FinishReason: s.finishReason, Reasoning: s.reasoning.String()}
 	if len(s.toolAccum) > 0 {
 		done.ToolCalls = s.provider.assembleToolCalls(s.parent, s.toolAccum)
 	}
@@ -362,7 +392,8 @@ func (s *httpStream) finish() (Chunk, error) {
 		s.err = &EmptyResponseError{
 			Endpoint:     endpointLabel(s.endpoint),
 			FinishReason: s.finishReason,
-			Detail:       "empty stream",
+			Detail:       emptyDetail(done.Reasoning, "empty stream"),
+			Reasoning:    done.Reasoning,
 		}
 		return Chunk{}, s.err
 	}
@@ -443,6 +474,10 @@ func (s *httpStream) Next() (Chunk, error) {
 			if tc.Function.Arguments != "" {
 				entry.arguments.WriteString(tc.Function.Arguments)
 			}
+		}
+
+		if r := choice.Delta.text(); r != "" {
+			s.reasoning.WriteString(r)
 		}
 
 		if delta := choice.Delta.Content; delta != "" {
@@ -615,8 +650,26 @@ type openAIToolCallDelta struct {
 	} `json:"function"`
 }
 
+// openAIReasoning is the model's thinking trace, which reasoning models return
+// beside the answer rather than inside it. Servers spell the field two ways —
+// vLLM 0.27 sends "reasoning", vLLM's own reasoning parsers and DeepSeek send
+// "reasoning_content" — so both are decoded and whichever arrived is used.
+type openAIReasoning struct {
+	Reasoning        string `json:"reasoning"`
+	ReasoningContent string `json:"reasoning_content"`
+}
+
+// text returns whichever spelling the server used.
+func (r openAIReasoning) text() string {
+	if r.Reasoning != "" {
+		return r.Reasoning
+	}
+	return r.ReasoningContent
+}
+
 // openAIDelta is the delta fragment inside one streamed event.
 type openAIDelta struct {
+	openAIReasoning
 	Content   string                `json:"content"`
 	ToolCalls []openAIToolCallDelta `json:"tool_calls,omitempty"`
 }
@@ -645,6 +698,7 @@ type openAIStreamEvent struct {
 type openAIChatResponse struct {
 	Choices []struct {
 		Message struct {
+			openAIReasoning
 			Content   string     `json:"content"`
 			ToolCalls []ToolCall `json:"tool_calls,omitempty"`
 		} `json:"message"`

@@ -97,6 +97,20 @@ try.
 **`vault` — there is no DEK rotation.** `Rotate` changes the passphrase, not the data
 key. A leaked data key means re-sealing everything.
 
+**`llm` — an empty completion is not necessarily a broken endpoint.** A reasoning model
+can spend a whole turn thinking and answer nothing. Measured against vLLM 0.27 serving
+Qwen3, that arrives as `content: null` beside a populated `reasoning` field, under
+`finish_reason` `stop` as readily as `length`, sometimes with most of the token budget
+unspent — so the finish reason cannot identify it. It is reported as `ErrEmptyResponse`
+with `EmptyResponseError.Reasoning` set, and that field is the signal: failing over to
+another endpoint is the wrong response, since the next machine running the same class of
+model does the same thing.
+
+**`llm` — a completion of nothing but whitespace is still a completion.** The same model
+returns `content: "\n\n"` often enough, and keel does not judge what counts as an answer:
+a caller putting text in front of a human should decide for itself whether what it got
+is one.
+
 ## What CI checks
 
 Every push and pull request to `main` runs three jobs, and between them they enforce the

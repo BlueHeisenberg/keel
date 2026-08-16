@@ -1553,3 +1553,380 @@ func keysOf(m map[string]any) []string {
 	}
 	return keys
 }
+
+// --- reasoning models ---------------------------------------------------------
+//
+// Every body and stream below was captured verbatim from vLLM 0.27.2 serving
+// twolven/Qwen3.8-27B-abliterated-AWQ-MTP, prompted with "Reply with exactly:
+// MONSTER OK". They are kept whole, null fields and vendor extensions included,
+// because the defect they pin lives in exactly the parts a hand-written fixture
+// would have tidied away.
+
+// vllmReasoningOnlyStop is the shape that motivated all of this: content null, a
+// full reasoning trace, finish_reason "stop", and 16 of the 52 permitted tokens
+// spent. Nothing in it says "truncated". A caller reading finish_reason concludes
+// the model chose silence and tells a human it got no usable answer, from a model
+// and an endpoint that were both working perfectly.
+const vllmReasoningOnlyStop = `{"id":"chatcmpl-93d665e121e49241","object":"chat.completion","created":1786872012,"model":"monster","choices":[{"index":0,"message":{"role":"assistant","content":null,"refusal":null,"annotations":null,"audio":null,"function_call":null,"reasoning":"The user wants me to reply with exactly the text \"MONSTER OK\""},"logprobs":null,"finish_reason":"stop","stop_reason":null,"token_ids":null,"routed_experts":null}],"service_tier":null,"system_fingerprint":"vllm-0.27.2rc1.dev110+gacb0f1dcd-tp2-cf712df4","usage":{"prompt_tokens":17,"total_tokens":33,"completion_tokens":16,"prompt_tokens_details":null},"prompt_logprobs":null,"prompt_token_ids":null,"prompt_text":null,"kv_transfer_params":null,"ec_transfer_params":null,"metrics":null}`
+
+// vllmReasoningOnlyLength is the same request at max_tokens 20, where the trace
+// really did exhaust the budget. Same defect, honest finish reason â€” which is why
+// the finish reason cannot be the discriminator: one request, one server, both
+// answers.
+const vllmReasoningOnlyLength = `{"id":"chatcmpl-a2bbb4e0b00c58ba","object":"chat.completion","created":1786871976,"model":"monster","choices":[{"index":0,"message":{"role":"assistant","content":null,"refusal":null,"annotations":null,"audio":null,"function_call":null,"reasoning":"The user wants me to reply with exactly the text \"MONSTER OK\" - nothing more, nothing"},"logprobs":null,"finish_reason":"length","stop_reason":null,"token_ids":null,"routed_experts":null}],"service_tier":null,"system_fingerprint":"vllm-0.27.2rc1.dev110+gacb0f1dcd-tp2-cf712df4","usage":{"prompt_tokens":17,"total_tokens":37,"completion_tokens":20,"prompt_tokens_details":null},"prompt_logprobs":null,"prompt_token_ids":null,"prompt_text":null,"kv_transfer_params":null,"ec_transfer_params":null,"metrics":null}`
+
+// vllmAnsweredWithReasoning is the same request given room to finish: the
+// reasoning arrives alongside a real answer, not instead of one.
+const vllmAnsweredWithReasoning = `{"id":"chatcmpl-ac29e3d4cff0f1c8","object":"chat.completion","created":1786872256,"model":"monster","choices":[{"index":0,"message":{"role":"assistant","content":"\n\nMONSTER OK","refusal":null,"annotations":null,"audio":null,"function_call":null,"reasoning":"The user wants me to reply with exactly \"MONSTER OK\" - nothing else, no extra whitespace, no period, just those two words.\n"},"logprobs":null,"finish_reason":"stop","stop_reason":null,"token_ids":null,"routed_experts":null}],"service_tier":null,"system_fingerprint":"vllm-0.27.2rc1.dev110+gacb0f1dcd-tp2-cf712df4","usage":{"prompt_tokens":17,"total_tokens":53,"completion_tokens":36,"prompt_tokens_details":null},"prompt_logprobs":null,"prompt_token_ids":null,"prompt_text":null,"kv_transfer_params":null,"ec_transfer_params":null,"metrics":null}`
+
+// vllmToolCallWithReasoning is a tool-calling turn from the same server: content
+// null, a reasoning trace, and a real tool call. It is not an empty response and
+// must not become one.
+const vllmToolCallWithReasoning = `{"id":"chatcmpl-80a09662e73ceeb6","object":"chat.completion","created":1786872037,"model":"monster","choices":[{"index":0,"message":{"role":"assistant","content":null,"refusal":null,"annotations":null,"audio":null,"function_call":null,"tool_calls":[{"id":"chatcmpl-tool-9a13d6fed146ef42","type":"function","function":{"name":"get_weather","arguments":"{\"city\": \"Paris\"}"}}],"reasoning":"The user is asking about the weather in Paris. I have a get_weather function that takes a city parameter. I'll call it with \"Paris\".\n"},"logprobs":null,"finish_reason":"tool_calls","stop_reason":null,"token_ids":null,"routed_experts":null}],"service_tier":null,"system_fingerprint":"vllm-0.27.2rc1.dev110+gacb0f1dcd-tp2-cf712df4","usage":{"prompt_tokens":271,"total_tokens":332,"completion_tokens":61,"prompt_tokens_details":null},"prompt_logprobs":null,"prompt_token_ids":null,"prompt_text":null,"kv_transfer_params":null,"ec_transfer_params":null,"metrics":null}`
+
+// jsonServer serves a fixed JSON body.
+func jsonServer(t *testing.T, body string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, body)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestChat_ReasoningOnlyIsDistinguishable is the load-bearing test. A model that
+// thought and then said nothing must not arrive looking like a broken endpoint:
+// the trace survives as data, the classification names the case, and the finish
+// reason â€” "stop" in one of these and "length" in the other, for the same defect
+// â€” is proved not to be the thing that tells them apart.
+func TestChat_ReasoningOnlyIsDistinguishable(t *testing.T) {
+	cases := []struct {
+		name          string
+		body          string
+		wantFinish    string
+		wantReasoning string
+	}{
+		{
+			name:          "finish_reason stop, budget barely spent",
+			body:          vllmReasoningOnlyStop,
+			wantFinish:    llm.FinishStop,
+			wantReasoning: `The user wants me to reply with exactly the text "MONSTER OK"`,
+		},
+		{
+			name:          "finish_reason length, budget exhausted",
+			body:          vllmReasoningOnlyLength,
+			wantFinish:    llm.FinishLength,
+			wantReasoning: `The user wants me to reply with exactly the text "MONSTER OK" - nothing more, nothing`,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			srv := jsonServer(t, c.body)
+
+			resp, err := quietProvider(t).Chat(context.Background(),
+				llm.Endpoint{BaseURL: srv.URL, Label: "monster"}, llm.ChatReq{})
+			if !errors.Is(err, llm.ErrEmptyResponse) {
+				t.Fatalf("Chat error = %v, want ErrEmptyResponse", err)
+			}
+
+			var emptyErr *llm.EmptyResponseError
+			if !errors.As(err, &emptyErr) {
+				t.Fatalf("errors.As(*EmptyResponseError) failed for %T", err)
+			}
+			if emptyErr.Reasoning != c.wantReasoning {
+				t.Errorf("EmptyResponseError.Reasoning = %q, want %q", emptyErr.Reasoning, c.wantReasoning)
+			}
+			if emptyErr.Detail != llm.DetailReasoningOnly {
+				t.Errorf("Detail = %q, want %q", emptyErr.Detail, llm.DetailReasoningOnly)
+			}
+			if emptyErr.FinishReason != c.wantFinish {
+				t.Errorf("FinishReason = %q, want %q", emptyErr.FinishReason, c.wantFinish)
+			}
+
+			// The Response is populated for the same reason the finish reason is:
+			// the caller decides what to do next and needs the evidence.
+			if resp.Reasoning != c.wantReasoning {
+				t.Errorf("Response.Reasoning = %q, want %q", resp.Reasoning, c.wantReasoning)
+			}
+			// content:null must stay empty content. Answering with the thinking
+			// trace would put chain-of-thought in front of a human as the answer.
+			if resp.Content != "" {
+				t.Errorf("Response.Content = %q, want empty", resp.Content)
+			}
+		})
+	}
+}
+
+// TestChat_ReasoningOnlyIsNotTheSameFaultAsSilence pins the distinction the whole
+// change exists for: two empty answers carrying the same finish reason, told
+// apart without parsing an error string.
+func TestChat_ReasoningOnlyIsNotTheSameFaultAsSilence(t *testing.T) {
+	const silent = `{"choices":[{"message":{"content":null},"finish_reason":"stop"}]}`
+
+	cases := []struct {
+		name       string
+		body       string
+		wantDetail string
+	}{
+		{"model thought and said nothing", vllmReasoningOnlyStop, llm.DetailReasoningOnly},
+		{"endpoint said nothing at all", silent, "empty choice"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			srv := jsonServer(t, c.body)
+			_, err := quietProvider(t).Chat(context.Background(),
+				llm.Endpoint{BaseURL: srv.URL}, llm.ChatReq{})
+
+			var emptyErr *llm.EmptyResponseError
+			if !errors.As(err, &emptyErr) {
+				t.Fatalf("errors.As(*EmptyResponseError) failed for %v", err)
+			}
+			if emptyErr.FinishReason != llm.FinishStop {
+				t.Fatalf("FinishReason = %q, want %q â€” the premise of this test is that both say stop",
+					emptyErr.FinishReason, llm.FinishStop)
+			}
+			if emptyErr.Detail != c.wantDetail {
+				t.Errorf("Detail = %q, want %q", emptyErr.Detail, c.wantDetail)
+			}
+		})
+	}
+}
+
+// TestEmptyResponseError_DoesNotDiscloseReasoning holds the line [APIError] holds
+// for provider prose: a thinking trace is model output, it quotes the prompt back
+// freely, and an error string is the one part of a failure that reaches a log
+// with nobody thinking about it.
+func TestEmptyResponseError_DoesNotDiscloseReasoning(t *testing.T) {
+	srv := jsonServer(t, vllmReasoningOnlyStop)
+
+	_, err := quietProvider(t).Chat(context.Background(),
+		llm.Endpoint{BaseURL: srv.URL, Label: "monster"}, llm.ChatReq{})
+	if err == nil {
+		t.Fatal("Chat succeeded, want ErrEmptyResponse")
+	}
+	if strings.Contains(err.Error(), "MONSTER OK") {
+		t.Errorf("error string %q leaks the reasoning trace", err.Error())
+	}
+	// It must still say enough to be actionable at 3am.
+	for _, want := range []string{"monster", llm.DetailReasoningOnly, "stop"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error string %q is missing %q", err.Error(), want)
+		}
+	}
+}
+
+// TestChat_ReasoningAlongsideAnAnswer checks the ordinary case stays ordinary:
+// given room to finish, the same model returns both, the answer is untouched by
+// the trace, and there is no error.
+func TestChat_ReasoningAlongsideAnAnswer(t *testing.T) {
+	srv := jsonServer(t, vllmAnsweredWithReasoning)
+
+	resp, err := quietProvider(t).Chat(context.Background(),
+		llm.Endpoint{BaseURL: srv.URL}, llm.ChatReq{})
+	if err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+	if resp.Content != "\n\nMONSTER OK" {
+		t.Errorf("Content = %q, want %q", resp.Content, "\n\nMONSTER OK")
+	}
+	if !strings.HasPrefix(resp.Reasoning, "The user wants me to reply with exactly") {
+		t.Errorf("Reasoning = %q, want the captured trace", resp.Reasoning)
+	}
+	if strings.Contains(resp.Content, "The user wants") {
+		t.Error("the reasoning trace leaked into Content")
+	}
+}
+
+// TestChat_ReasoningContentSpelling covers the other wire spelling. vLLM's own
+// reasoning parsers and DeepSeek send "reasoning_content" where the server
+// measured here sends "reasoning"; decoding only one of them would leave the same
+// silent failure in place on the other deployment.
+func TestChat_ReasoningContentSpelling(t *testing.T) {
+	const body = `{"choices":[{"message":{"content":null,"reasoning_content":"thinking about it"},"finish_reason":"stop"}]}`
+	srv := jsonServer(t, body)
+
+	resp, err := quietProvider(t).Chat(context.Background(),
+		llm.Endpoint{BaseURL: srv.URL}, llm.ChatReq{})
+
+	var emptyErr *llm.EmptyResponseError
+	if !errors.As(err, &emptyErr) {
+		t.Fatalf("errors.As(*EmptyResponseError) failed for %v", err)
+	}
+	if emptyErr.Detail != llm.DetailReasoningOnly {
+		t.Errorf("Detail = %q, want %q", emptyErr.Detail, llm.DetailReasoningOnly)
+	}
+	if resp.Reasoning != "thinking about it" {
+		t.Errorf("Response.Reasoning = %q, want %q", resp.Reasoning, "thinking about it")
+	}
+}
+
+// TestChat_ToolCallWithReasoningIsNotEmpty checks the boundary from the other
+// side: content null plus a reasoning trace is a real completion when a tool call
+// came with it, and the trace must not turn a working turn into an error.
+func TestChat_ToolCallWithReasoningIsNotEmpty(t *testing.T) {
+	srv := jsonServer(t, vllmToolCallWithReasoning)
+
+	resp, err := quietProvider(t).Chat(context.Background(),
+		llm.Endpoint{BaseURL: srv.URL}, llm.ChatReq{})
+	if err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+	if len(resp.ToolCalls) != 1 || resp.ToolCalls[0].Function.Name != "get_weather" {
+		t.Fatalf("tool calls = %+v, want one get_weather", resp.ToolCalls)
+	}
+	if !strings.Contains(resp.Reasoning, "weather in Paris") {
+		t.Errorf("Reasoning = %q, want the captured trace", resp.Reasoning)
+	}
+}
+
+// vllmReasoningOnlyStream is the streaming form of the same defect, captured
+// verbatim at max_tokens 20: nothing but reasoning deltas, finish_reason
+// "length", then usage and the sentinel. Every content delta the reader looks for
+// is absent, so the stream ends having produced nothing.
+const vllmReasoningOnlyStream = `data: {"id":"chatcmpl-bb630545750ff6ea","object":"chat.completion.chunk","created":1786872015,"model":"monster","choices":[{"index":0,"delta":{"role":"assistant","content":""},"logprobs":null,"finish_reason":null}],"prompt_token_ids":null,"prompt_text":null}
+
+data: {"id":"chatcmpl-bb630545750ff6ea","object":"chat.completion.chunk","created":1786872015,"model":"monster","choices":[{"index":0,"delta":{"reasoning":"The"},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-bb630545750ff6ea","object":"chat.completion.chunk","created":1786872015,"model":"monster","choices":[{"index":0,"delta":{"reasoning":" user wants me to"},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-bb630545750ff6ea","object":"chat.completion.chunk","created":1786872015,"model":"monster","choices":[{"index":0,"delta":{"reasoning":" reply with exactly the"},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-bb630545750ff6ea","object":"chat.completion.chunk","created":1786872015,"model":"monster","choices":[{"index":0,"delta":{"reasoning":" text \"MONSTER"},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-bb630545750ff6ea","object":"chat.completion.chunk","created":1786872015,"model":"monster","choices":[{"index":0,"delta":{"reasoning":" OK\"."},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-bb630545750ff6ea","object":"chat.completion.chunk","created":1786872015,"model":"monster","choices":[{"index":0,"delta":{"reasoning":" This"},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-bb630545750ff6ea","object":"chat.completion.chunk","created":1786872015,"model":"monster","choices":[{"index":0,"delta":{"reasoning":" is a straightforward"},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-bb630545750ff6ea","object":"chat.completion.chunk","created":1786872015,"model":"monster","choices":[{"index":0,"delta":{"reasoning":" instruction"},"logprobs":null,"finish_reason":"length","stop_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-bb630545750ff6ea","object":"chat.completion.chunk","created":1786872015,"model":"monster","choices":[],"usage":{"prompt_tokens":17,"total_tokens":37,"completion_tokens":20},"system_fingerprint":"vllm-0.27.2rc1.dev110+gacb0f1dcd-tp2-cf712df4"}
+
+data: [DONE]
+
+`
+
+// vllmAnsweredStream is the same stream given room to finish: reasoning deltas
+// first, then the answer, then usage.
+const vllmAnsweredStream = `data: {"id":"chatcmpl-a3344471d71a8565","object":"chat.completion.chunk","created":1786872047,"model":"monster","choices":[{"index":0,"delta":{"role":"assistant","content":""},"logprobs":null,"finish_reason":null}],"prompt_token_ids":null,"prompt_text":null}
+
+data: {"id":"chatcmpl-a3344471d71a8565","object":"chat.completion.chunk","created":1786872047,"model":"monster","choices":[{"index":0,"delta":{"reasoning":"The"},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-a3344471d71a8565","object":"chat.completion.chunk","created":1786872047,"model":"monster","choices":[{"index":0,"delta":{"reasoning":" user wants me to"},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-a3344471d71a8565","object":"chat.completion.chunk","created":1786872047,"model":"monster","choices":[{"index":0,"delta":{"reasoning":" reply with exactly:"},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-a3344471d71a8565","object":"chat.completion.chunk","created":1786872047,"model":"monster","choices":[{"index":0,"delta":{"reasoning":" MONSTER OK\n"},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-a3344471d71a8565","object":"chat.completion.chunk","created":1786872047,"model":"monster","choices":[{"index":0,"delta":{"content":"\n\nMONSTER"},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-a3344471d71a8565","object":"chat.completion.chunk","created":1786872047,"model":"monster","choices":[{"index":0,"delta":{"content":" OK"},"logprobs":null,"finish_reason":"stop","stop_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-a3344471d71a8565","object":"chat.completion.chunk","created":1786872047,"model":"monster","choices":[],"usage":{"prompt_tokens":17,"total_tokens":36,"completion_tokens":19},"system_fingerprint":"vllm-0.27.2rc1.dev110+gacb0f1dcd-tp2-cf712df4"}
+
+data: [DONE]
+
+`
+
+// wantStreamReasoning is the trace vllmReasoningOnlyStream spells one delta at a
+// time.
+const wantStreamReasoning = `The user wants me to reply with exactly the text "MONSTER OK". This is a straightforward instruction`
+
+// TestChatStream_ReasoningOnlyStreamIsDistinguishable is the streaming sibling of
+// the blocking case. The same defect arrives by a different route and must not be
+// fixed on one path only: the stream produced nothing, so it is still an empty
+// response, but the trace comes back with it.
+func TestChatStream_ReasoningOnlyStreamIsDistinguishable(t *testing.T) {
+	srv, _ := sseServer(t, vllmReasoningOnlyStream)
+
+	out := make(chan llm.Chunk, 8)
+	ep := llm.Endpoint{BaseURL: srv.URL, Model: "monster", Label: "monster"}
+	err := quietProvider(t).ChatStream(context.Background(), ep, llm.ChatReq{}, out)
+
+	if !errors.Is(err, llm.ErrEmptyResponse) {
+		t.Fatalf("ChatStream error = %v, want ErrEmptyResponse", err)
+	}
+	// Reasoning is not an answer: emitting it would put chain-of-thought into
+	// the caller's output, and would make the failure unsafe to fail over on by
+	// having forwarded something first.
+	if len(out) != 0 {
+		t.Errorf("%d chunks reached the caller, want 0", len(out))
+	}
+
+	var emptyErr *llm.EmptyResponseError
+	if !errors.As(err, &emptyErr) {
+		t.Fatalf("errors.As(*EmptyResponseError) failed for %T", err)
+	}
+	if emptyErr.Reasoning != wantStreamReasoning {
+		t.Errorf("Reasoning = %q, want %q", emptyErr.Reasoning, wantStreamReasoning)
+	}
+	if emptyErr.Detail != llm.DetailReasoningOnly {
+		t.Errorf("Detail = %q, want %q", emptyErr.Detail, llm.DetailReasoningOnly)
+	}
+	if emptyErr.FinishReason != llm.FinishLength {
+		t.Errorf("FinishReason = %q, want %q", emptyErr.FinishReason, llm.FinishLength)
+	}
+	if strings.Contains(err.Error(), "MONSTER OK") {
+		t.Errorf("error string %q leaks the reasoning trace", err.Error())
+	}
+}
+
+// TestChatStreamReader_ReasoningOnlyStream covers the pull path, which is the one
+// a failing-over caller uses and therefore the one where a wrong classification
+// costs the most.
+func TestChatStreamReader_ReasoningOnlyStream(t *testing.T) {
+	srv, _ := sseServer(t, vllmReasoningOnlyStream)
+
+	ep := llm.Endpoint{BaseURL: srv.URL, Model: "monster"}
+	stream, err := quietProvider(t).ChatStreamReader(context.Background(), ep, llm.ChatReq{})
+	if err != nil {
+		t.Fatalf("ChatStreamReader: %v", err)
+	}
+	defer stream.Close()
+
+	chunk, err := stream.Next()
+	if chunk.Done || chunk.Delta != "" {
+		t.Errorf("Next handed back %+v, want nothing", chunk)
+	}
+
+	var emptyErr *llm.EmptyResponseError
+	if !errors.As(err, &emptyErr) {
+		t.Fatalf("errors.As(*EmptyResponseError) failed for %v", err)
+	}
+	if emptyErr.Detail != llm.DetailReasoningOnly {
+		t.Errorf("Detail = %q, want %q", emptyErr.Detail, llm.DetailReasoningOnly)
+	}
+	if emptyErr.Reasoning != wantStreamReasoning {
+		t.Errorf("Reasoning = %q, want %q", emptyErr.Reasoning, wantStreamReasoning)
+	}
+}
+
+// TestChatStream_ReasoningIsNotEmittedAsAnswerText checks the successful stream:
+// the deltas the caller receives are the answer and only the answer, while the
+// trace arrives whole on the Done chunk for whoever wants it.
+func TestChatStream_ReasoningIsNotEmittedAsAnswerText(t *testing.T) {
+	srv, _ := sseServer(t, vllmAnsweredStream)
+
+	out := make(chan llm.Chunk, 16)
+	wait := startCollector(out)
+
+	ep := llm.Endpoint{BaseURL: srv.URL, Model: "monster"}
+	if err := quietProvider(t).ChatStream(context.Background(), ep, llm.ChatReq{}, out); err != nil {
+		t.Fatalf("ChatStream: %v", err)
+	}
+
+	chunks := wait()
+	if got := joinDeltas(chunks); got != "\n\nMONSTER OK" {
+		t.Errorf("assembled deltas = %q, want %q", got, "\n\nMONSTER OK")
+	}
+
+	done := doneChunk(t, chunks)
+	if want := "The user wants me to reply with exactly: MONSTER OK\n"; done.Reasoning != want {
+		t.Errorf("Done.Reasoning = %q, want %q", done.Reasoning, want)
+	}
+	if done.TokensOut != 19 {
+		t.Errorf("Done.TokensOut = %d, want 19", done.TokensOut)
+	}
+}

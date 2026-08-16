@@ -35,11 +35,31 @@ var ErrInvalidRequest = errors.New("llm: invalid request")
 // error. [FinishContentFilter] means the provider declined on purpose, and that
 // decision is final: walking the rest of a fallback chain will get the request
 // refused again at every stop, or answered by whichever machine has the weakest
-// scruples, which is worse than refusing. Any other finish reason on an empty
-// answer is a malfunction, and trying elsewhere is right.
+// scruples, which is worse than refusing.
+//
+// # The finish reason is not enough on its own
+//
+// A reasoning model can spend a whole turn thinking and answer nothing, and the
+// finish reason does not identify that case — it cannot be made to. Measured
+// against vLLM 0.27 serving Qwen3, the identical request came back empty under
+// both [FinishLength] and [FinishStop], the latter with the token budget barely
+// half spent. A caller reading only the finish reason sees "stop", concludes the
+// model chose to say nothing, and reports a healthy endpoint as mute.
+//
+// What identifies it is [EmptyResponseError.Reasoning]. Non-empty means the
+// model produced a thinking trace and no answer, and failing over is the wrong
+// response: the next endpoint running the same class of model behaves the same
+// way. What helps is room to answer in — a larger max_tokens — or a request that
+// spends less of the budget thinking, such as the [Endpoint.ExtraBody] that
+// turns thinking off. This package does not choose between those; it makes the
+// choice visible.
+//
+// Any other empty answer — no content, no tool call, no reasoning, no refusal —
+// is a malfunction, and trying elsewhere is right.
 //
 // Errors that wrap this sentinel are always an [EmptyResponseError], so
-// errors.As reaches the finish reason without parsing an error string.
+// errors.As reaches the finish reason and the reasoning trace without parsing an
+// error string.
 var ErrEmptyResponse = errors.New("llm: endpoint produced no completion")
 
 // EmptyResponseError is the concrete error wrapping [ErrEmptyResponse]. It
@@ -57,9 +77,24 @@ type EmptyResponseError struct {
 	FinishReason string
 
 	// Detail names the shape of the emptiness ("no choices", "empty choice",
-	// "empty stream"). It is a fixed classification, never provider text.
+	// "empty stream", [DetailReasoningOnly]). It is a fixed classification,
+	// never provider text.
 	Detail string
+
+	// Reasoning is the model's thinking trace, when it produced one and then
+	// said nothing. Non-empty means the endpoint and the model both worked: the
+	// model thought and did not answer. That is a different fault from silence,
+	// and the one signal that tells them apart — see [ErrEmptyResponse].
+	//
+	// It is model output, so [EmptyResponseError.Error] does not render it, for
+	// the same reason [APIError.Error] omits the provider's prose. Read the
+	// field when you want it.
+	Reasoning string
 }
+
+// DetailReasoningOnly is the [EmptyResponseError.Detail] value for an answer
+// that carried a reasoning trace and no content.
+const DetailReasoningOnly = "reasoning only"
 
 // Error implements error. Like [APIError.Error] it renders only classifiers,
 // never provider prose or caller content.

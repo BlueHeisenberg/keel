@@ -20,6 +20,10 @@
 // again. Use [IsTransport] and [IsAPI], or errors.As with the concrete types.
 // Two sentinels sit outside that pair: [ErrInvalidRequest] for a call that could
 // not be built, and [ErrEmptyResponse] for a success that carried no completion.
+// The second covers a case the finish reason cannot: a reasoning model that
+// spends its turn thinking and answers nothing. [EmptyResponseError.Reasoning]
+// is what tells that apart from an endpoint that is simply broken, and the two
+// deserve opposite responses.
 //
 // Error strings here are safe to log. [APIError] deliberately keeps the
 // provider's prose out of its Error method, because those bodies quote the

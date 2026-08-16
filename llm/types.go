@@ -182,6 +182,12 @@ type Chunk struct {
 	// Delta is the text fragment produced by this event.
 	Delta string `json:"delta,omitempty"`
 
+	// Reasoning is the model's complete thinking trace, attached to the Done
+	// chunk. Reasoning is deliberately not streamed a fragment at a time: it is
+	// not part of the answer, and a caller printing every Delta must not find
+	// chain-of-thought in the middle of one. Empty when the provider sent none.
+	Reasoning string `json:"reasoning,omitempty"`
+
 	// Done marks the terminal chunk of a stream.
 	Done bool `json:"done,omitempty"`
 
@@ -211,6 +217,21 @@ type Chunk struct {
 type Response struct {
 	// Content is the assistant's message text.
 	Content string `json:"content"`
+
+	// Reasoning is the model's thinking trace, when the provider returned one
+	// beside the answer — the "reasoning" or "reasoning_content" field that
+	// reasoning models populate. Empty when the provider sent none.
+	//
+	// It is not an answer and this package never substitutes it for one. What to
+	// do with it is the caller's decision: show it, log it, count it, or ignore
+	// it. Note that it is model output like any other, so it belongs wherever
+	// the caller already allows content to go, not in an operator log by
+	// default.
+	//
+	// A completion with a Reasoning trace and no Content is an
+	// [EmptyResponseError] — see [ErrEmptyResponse], and read that error's own
+	// Reasoning field before deciding to fail over.
+	Reasoning string `json:"reasoning,omitempty"`
 
 	// ToolCalls are the tool invocations the model requested, if any.
 	ToolCalls []ToolCall `json:"toolCalls,omitempty"`
