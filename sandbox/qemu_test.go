@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -447,14 +448,49 @@ func TestRemoveSnapshot_ArgVector(t *testing.T) {
 	}
 }
 
-func TestRemoveSnapshot_MissingTolerated(t *testing.T) {
-	r := &mockRunner{}
-	b := newQemuTestBackend(t, r)
-	r.responses = []mockResponse{fail("Can't find snapshot tagY")}
+// TestRemoveSnapshot_AgainstRealQemuImgBehaviour drives RemoveSnapshot with the
+// bytes real qemu-img 8.2.2 produces, taken from measuredToolOutput, and in the
+// error shape QemuBackend.run really builds — a CommandError that keeps stderr
+// out of Error(), so a classifier reading err.Error() sees nothing.
+//
+// The version this replaced asserted `fail("Can't find snapshot tagY")`: a
+// plain errors.New carrying a sentence no qemu-img has ever printed.  It passed
+// because isQemuSnapshotMissing matched a string invented in the same commit as
+// the test, and it exercised neither the real message nor the real error shape.
+func TestRemoveSnapshot_AgainstRealQemuImgBehaviour(t *testing.T) {
+	t.Run("missing snapshot is tolerated", func(t *testing.T) {
+		s := sampleFor(t, `qemu-img snapshot -d nosuchsnap disk.qcow2`)
+		r := &mockRunner{responses: []mockResponse{{
+			stderr: []byte(s.Stderr),
+			err:    &exec.ExitError{ProcessState: &os.ProcessState{}},
+		}}}
+		b := newQemuTestBackend(t, r)
+		if err := b.RemoveSnapshot(context.Background(), "qemu:sb-vm-rs2:nosuchsnap"); err != nil {
+			t.Errorf("RemoveSnapshot should tolerate a missing snapshot, got %v", err)
+		}
+	})
 
-	if err := b.RemoveSnapshot(context.Background(), "qemu:sb-vm-rs2:tagY"); err != nil {
-		t.Errorf("RemoveSnapshot should tolerate missing snapshot, got %v", err)
-	}
+	// The other half, and the reason "could not delete snapshot" is no longer
+	// matched: a failure that is not an absence must reach the caller.  With
+	// that prefix in the classifier, any `Could not ... snapshot` line — the
+	// generic wrapper qemu-img puts on every failure of these verbs — was
+	// reported to the caller as success.
+	t.Run("a failure that is not an absence is surfaced", func(t *testing.T) {
+		for _, cmd := range []string{
+			`qemu-img snapshot -d anysnap /tmp/qt/nosuchimage.qcow2`,
+			`qemu-img snapshot -d keepme /tmp/qt/adir`,
+		} {
+			s := sampleFor(t, cmd)
+			r := &mockRunner{responses: []mockResponse{{
+				stderr: []byte(s.Stderr),
+				err:    &exec.ExitError{ProcessState: &os.ProcessState{}},
+			}}}
+			b := newQemuTestBackend(t, r)
+			if err := b.RemoveSnapshot(context.Background(), "qemu:sb-vm-rs3:anysnap"); err == nil {
+				t.Errorf("RemoveSnapshot swallowed a real failure as success\ncmd: %s\nstderr: %s", cmd, s.Stderr)
+			}
+		}
+	})
 }
 
 func TestRestore_LiveLoadvm(t *testing.T) {

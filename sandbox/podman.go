@@ -235,15 +235,66 @@ func (b *PodmanBackend) Create(ctx context.Context, spec Spec) (Handle, error) {
 		return Handle{}, err
 	}
 
-	// Ensure the named volume exists (idempotent).
+	// Ensure the named volume exists.  `podman volume create <name>` is NOT
+	// idempotent, whatever the comment here used to claim: against an existing
+	// volume real podman 4.9.3 exits 125 with
+	//
+	//	Error: volume with name X already exists: volume already exists
+	//
+	// (measured — see measuredToolOutput in measured_test.go).  A work volume
+	// outliving its container is reachable — removeContainer and Recreate both
+	// leave it standing by design, and Purge is the only thing that deletes one
+	// — so before this, Create for that sandbox failed forever.
+	//
+	// Adopting an existing volume rather than refusing it is the right default
+	// here because the name is not a stranger's to collide with: it is
+	// Config.NamePrefix + the caller's own sandbox id + "-work", and Recreate
+	// already reattaches whatever volume answers to it (`--volume vol:/work`
+	// creates or reuses, silently, and has always done so).  Create refusing
+	// what Recreate accepts would only mean a restart after a lost container
+	// could never be repaired.  A caller who wants a guaranteed-empty volume
+	// says so by calling Purge first — that is what Purge is for.
+	//
+	// What adoption must NOT do is give Create the right to delete data it did
+	// not create, and that is what cleanup below turns on: Create made the
+	// volume → Purge, so a spec that cannot launch does not leak a
+	// container-less volume; the volume predates the call → removeContainer,
+	// which by construction issues no volume command at all, so a failed
+	// restart cannot destroy the data the restart existed to preserve.
+	//
+	// The "already exists" case is recognised WITHOUT reading podman's wording.
+	// `podman volume exists` answers by exit status alone, so the tolerated
+	// failure is confirmed against the state of the host rather than against a
+	// sentence that a future podman could rephrase — which is the whole class of
+	// bug this file has been paying for.  It costs one extra call, only on the
+	// path that was previously a hard failure.
 	vol := b.volumeName(spec.Name)
+	cleanup := b.Purge
 	if _, _, err := b.podman(ctx, []string{"volume", "create", vol}, nil); err != nil {
-		return Handle{}, fmt.Errorf("sandbox create volume: %w", err)
+		if !b.volumeExists(ctx, vol) {
+			return Handle{}, fmt.Errorf("sandbox create volume: %w", err)
+		}
+		b.log.Debug("sandbox create: work volume already exists, adopting it",
+			"sandbox", spec.Name, "volume", vol)
+		cleanup = b.removeContainer
 	}
 
-	// Create made the volume, so Create's failure cleanup is Purge: a spec
-	// that cannot launch must not leak a container-less volume.
-	return b.launch(ctx, spec, image, "create", b.Purge)
+	return b.launch(ctx, spec, image, "create", cleanup)
+}
+
+// volumeExists reports whether a named volume is present.  `podman volume
+// exists` answers by exit status alone — 0 present, 1 absent, nothing on either
+// stream (measured, podman 4.9.3) — so this asks the question without matching
+// on any message that a future podman could reword.
+//
+// Any error at all is read as "absent", including a broken or missing podman.
+// Its one caller asks only after a volume create has already failed, and reads
+// "absent" as "that failure was real, give it to the caller" — so an
+// unanswerable question surfaces the original error rather than papering over
+// it, which is the direction this call should fail in.
+func (b *PodmanBackend) volumeExists(ctx context.Context, vol string) bool {
+	_, _, err := b.podman(ctx, []string{"volume", "exists", vol}, nil)
+	return err == nil
 }
 
 // Recreate implements Backend.Recreate: the container is replaced from spec —
@@ -942,6 +993,13 @@ func errText(err error) string {
 // indicates the target container, volume, or image simply does not exist.
 // Such "not found" failures are tolerated during best-effort cleanup so a
 // partially-provisioned sandbox does not orphan its other resources.
+//
+// Every literal below is measured against real podman 4.9.3 and recorded in
+// measuredToolOutput (measured_test.go), which the build enforces.  Note what
+// is NOT here: "no such image", the Docker phrasing.  podman 4.9.3 answers
+// every missing-image path this package uses — rmi, image rm, inspect --type
+// image, tag, history — with "<ref>: image not known" and never produces "no
+// such image", so matching it was matching a message no tool sends.
 func isNotFoundErr(err error) bool {
 	if err == nil {
 		return false
@@ -951,12 +1009,18 @@ func isNotFoundErr(err error) bool {
 		strings.Contains(msg, "no container with name") ||
 		strings.Contains(msg, "no such volume") ||
 		strings.Contains(msg, "no volume with name") ||
-		strings.Contains(msg, "no such image") ||
 		strings.Contains(msg, "image not known")
 }
 
 // isNoSuchContainer reports whether err indicates the container does not
-// exist, for mapping to ErrSandboxNotFound.
+// exist, for mapping to ErrSandboxNotFound.  Both literals are measured; see
+// isNotFoundErr and measuredToolOutput.
+//
+// "no such container" is doing the real work: podman words the leading clause
+// differently per subcommand — `stop`/`start`/`exec`/`commit` say `no container
+// with name or ID "X" found`, `rm` says `no container with ID or name "X"
+// found` — and only the trailing `: no such container` is common to all of
+// them.  `inspect --type container` says just `no such container X`.
 func isNoSuchContainer(err error) bool {
 	if err == nil {
 		return false

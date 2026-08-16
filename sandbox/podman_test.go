@@ -1804,8 +1804,23 @@ func TestRecreate_FailurePathsNeverDeleteVolume(t *testing.T) {
 //
 // Bare `inspect` resolves containers *and* images, so it neither says anything
 // isNoSuchContainer recognises nor fails at all when an image answers to the
-// name.  Everything else falls through to an empty success.
-type podmanEmulator struct{ existingImages map[string]bool }
+// name.
+//
+// It also models `volume create` and `volume exists`, which podman 4.9.3
+// answers like this (measured; recorded in measuredToolOutput):
+//
+//	$ podman volume create keel-ok-vol      # already exists
+//	Error: volume with name keel-ok-vol already exists: volume already exists  (exit 125)
+//	$ podman volume exists keel-nope-work
+//	                                             (no output, exit 1 — absent)
+//	$ podman volume exists keel-yes-work
+//	                                             (no output, exit 0 — present)
+//
+// Everything else falls through to an empty success.
+type podmanEmulator struct {
+	existingImages  map[string]bool
+	existingVolumes map[string]bool
+}
 
 func (p podmanEmulator) Run(_ context.Context, args []string, _ []byte, _ []string) ([]byte, []byte, error) {
 	if len(args) < 2 {
@@ -1826,6 +1841,26 @@ func (p podmanEmulator) Run(_ context.Context, args []string, _ []byte, _ []stri
 		}
 	case "start", "stop":
 		return nil, []byte(`Error: no container with name or ID "` + name + `" found: no such container`), exit
+	case "volume":
+		if len(args) < 4 {
+			return nil, nil, nil
+		}
+		switch args[2] {
+		case "create":
+			if p.existingVolumes[name] {
+				return nil, []byte("Error: volume with name " + name + " already exists: volume already exists"), exit
+			}
+			if p.existingVolumes != nil {
+				p.existingVolumes[name] = true
+			}
+			return []byte(name + "\n"), nil, nil
+		case "exists":
+			if p.existingVolumes[name] {
+				return nil, nil, nil
+			}
+			return nil, nil, exit
+		}
+		return nil, nil, nil
 	default:
 		return nil, nil, nil
 	}
@@ -1882,6 +1917,107 @@ func TestStopStart_MissingSandboxAgainstRealPodmanBehaviour(t *testing.T) {
 	if err := b.Stop(context.Background(), "sb-gone"); !errors.Is(err, ErrSandboxNotFound) {
 		t.Errorf("Stop on missing sandbox: want ErrSandboxNotFound, got %v", err)
 	}
+}
+
+// TestCreate_ExistingWorkVolumeAgainstRealPodmanBehaviour pins the third bug of
+// this class: the comment on the volume step claimed `podman volume create` was
+// idempotent, and it is not — real podman 4.9.3 exits 125 with
+// `volume with name X already exists: volume already exists`.  A work volume
+// that outlives its container is an ordinary state (removeContainer and
+// Recreate both leave it standing, Purge alone deletes it), and before the fix
+// Create for that sandbox failed forever.
+//
+// The emulator answers `volume create` the way podman does, so removing
+// Create's tolerance makes this test fail with the real error.
+func TestCreate_ExistingWorkVolumeAgainstRealPodmanBehaviour(t *testing.T) {
+	cfg := Config{}.withDefaults()
+	vol := cfg.NamePrefix + "sb-restart" + "-work"
+	b := newPodmanBackendWithRunner(
+		podmanEmulator{existingVolumes: map[string]bool{vol: true}}, slog.Default())
+
+	spec := Spec{
+		Name:          "sb-restart",
+		Image:         "img:1",
+		Profile:       ProfileHeadless,
+		NetworkPolicy: NetworkPolicyOpen, // no host egress tooling under test
+	}
+	if _, err := b.Create(context.Background(), spec); err != nil {
+		t.Fatalf("Create over an existing work volume must succeed, got %v", err)
+	}
+}
+
+// TestCreate_AdoptedVolumeSurvivesLaunchFailure guards the cost of the fix
+// above.  Create's failure cleanup is Purge — the one method that deletes the
+// work volume — on the reasoning that Create made the volume and so may unmake
+// it.  That reasoning stops holding the moment Create adopts a volume it did
+// not create, and the caller's data is exactly what such an adoption is for: a
+// restart after the container was lost.  So an adopted volume downgrades the
+// cleanup to removeContainer, which issues no volume command at all.
+func TestCreate_AdoptedVolumeSurvivesLaunchFailure(t *testing.T) {
+	alreadyExists := &CommandError{
+		Tool: "podman", Subcommand: "volume", ExitCode: 125,
+		Stderr: "Error: volume with name sbx-sb-adopt-work already exists: volume already exists",
+		Err:    &exec.ExitError{ProcessState: &os.ProcessState{}},
+	}
+	// Spec.Files puts the failure on the provisioning step, which is a failure
+	// after the container exists and so the one that actually runs cleanup.
+	spec := Spec{
+		Name: "sb-adopt", Image: "img:1", Profile: ProfileHeadless,
+		NetworkPolicy: NetworkPolicyOpen,
+		Files:         []File{{Path: "/etc/app/x", Data: []byte("d"), Mode: 0o600}},
+	}
+
+	r := &mockRunner{responses: []mockResponse{
+		{err: alreadyExists}, // volume create → already exists
+		ok(""),               // volume exists → present (exit 0)
+		ok("cid\n"),          // create
+		fail("cp exploded"),  // cp           → provisioning fails
+		ok(""), ok(""),       // cleanup: stop, rm — and nothing else
+	}}
+	b := newTestBackend(r)
+	if _, err := b.Create(context.Background(), spec); err == nil {
+		t.Fatal("expected the provisioning failure to surface")
+	}
+	if sawVolumeRemove(r.calls) {
+		t.Fatalf("Create deleted a work volume it did not create: %v", callArgvs(r.calls))
+	}
+
+	// And the converse: a volume Create DID make is still reaped, so a spec that
+	// cannot launch does not leak a container-less volume.
+	r = &mockRunner{responses: []mockResponse{
+		ok("vol\n"),            // volume create → created by us
+		ok("cid\n"),            // create
+		fail("cp exploded"),    // cp            → provisioning fails
+		ok(""), ok(""), ok(""), // cleanup: stop, rm, volume rm
+	}}
+	b = newTestBackend(r)
+	spec.Name = "sb-owned"
+	if _, err := b.Create(context.Background(), spec); err == nil {
+		t.Fatal("expected the provisioning failure to surface")
+	}
+	if !sawVolumeRemove(r.calls) {
+		t.Fatalf("Create leaked the volume it created: %v", callArgvs(r.calls))
+	}
+}
+
+// callArgvs renders just the argv of each call, so a failure message about a
+// `podman cp` sequence does not bury itself under the tar stream on its stdin.
+func callArgvs(calls []call) []string {
+	out := make([]string, 0, len(calls))
+	for _, c := range calls {
+		out = append(out, argString(c.args))
+	}
+	return out
+}
+
+// sawVolumeRemove reports whether any call deleted a volume.
+func sawVolumeRemove(calls []call) bool {
+	for _, c := range calls {
+		if len(c.args) > 2 && c.args[1] == "volume" && c.args[2] == "rm" {
+			return true
+		}
+	}
+	return false
 }
 
 // TestStopStart_NotFoundViaCommandErrorDetail does the same via the

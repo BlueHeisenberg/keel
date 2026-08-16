@@ -1060,17 +1060,45 @@ func parseSnapshotRef(ref string) (id, tag string, ok bool) {
 	return rest[:idx], rest[idx+1:], true
 }
 
-// isQemuSnapshotMissing reports whether a qemu-img error indicates the named
-// snapshot simply does not exist.
+// isQemuSnapshotMissing reports whether a `qemu-img snapshot -d` error means the
+// named snapshot simply is not there, which RemoveSnapshot tolerates.
+//
+// Measured against qemu-img 8.2.2 and recorded in measuredToolOutput
+// (measured_test.go):
+//
+//	$ qemu-img snapshot -d nosuchsnap disk.qcow2
+//	qemu-img: Could not delete snapshot 'nosuchsnap': snapshot not found   (exit 1)
+//
+// Three of the four strings this used to match are gone, and the deletions are
+// the point:
+//
+//   - "can't find snapshot" and "no such snapshot" were never produced by the
+//     tool at all.  They were matching a message nothing sends.
+//
+//   - "could not delete snapshot" IS in the real message, but only as the
+//     generic prefix qemu-img wraps a -d failure in; the trailing clause is the
+//     half that names the cause.  Matching the prefix therefore classifies "the
+//     delete failed" as "the snapshot was not there", which are different
+//     facts.  Matching only the trailing clause costs nothing, because the
+//     prefix never appears without it in any output measured here.
+//
+//     Honesty about the evidence: no invocation producing "Could not delete
+//     snapshot 'X': <something other than snapshot not found>" was reproduced.
+//     Every failure that could be staged — missing file, a directory, an
+//     unreadable file, an immutable file, a non-image probed as raw — fails
+//     earlier, at open, and says "Could not open".  So the prefix is dropped
+//     because it is redundant and strictly broader than the fact it stood for,
+//     not because a counterexample was caught.
+//
+// A qemu-img that words this differently now makes RemoveSnapshot return the
+// error rather than silently claim success — loud and fixable, which is the
+// direction an unverified guess should fail in.
 func isQemuSnapshotMissing(err error) bool {
 	if err == nil {
 		return false
 	}
 	msg := errText(err)
-	return strings.Contains(msg, "can't find snapshot") ||
-		strings.Contains(msg, "snapshot not found") ||
-		strings.Contains(msg, "no such snapshot") ||
-		strings.Contains(msg, "could not delete snapshot")
+	return strings.Contains(msg, "snapshot not found")
 }
 
 // pidfileAlive reports whether the pidfile exists and names a live process.
