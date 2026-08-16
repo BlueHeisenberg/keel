@@ -555,7 +555,7 @@ func (b *PodmanBackend) applyHostEgress(ctx context.Context, sandboxID, containe
 
 // containerPID returns the host PID of the container's init process.
 func (b *PodmanBackend) containerPID(ctx context.Context, sandboxID string) (string, error) {
-	stdout, _, err := b.podman(ctx, []string{"inspect", "--format", "{{.State.Pid}}", b.containerName(sandboxID)}, nil)
+	stdout, _, err := b.podman(ctx, []string{"inspect", "--type", "container", "--format", "{{.State.Pid}}", b.containerName(sandboxID)}, nil)
 	if err != nil {
 		return "", err
 	}
@@ -569,7 +569,7 @@ func (b *PodmanBackend) containerPID(ctx context.Context, sandboxID string) (str
 // containerGateway returns the host-gateway IP the container uses to reach the
 // host (host.containers.internal / default-route gateway).
 func (b *PodmanBackend) containerGateway(ctx context.Context, sandboxID string) (string, error) {
-	stdout, _, err := b.podman(ctx, []string{"inspect", "--format", "{{.NetworkSettings.Gateway}}", b.containerName(sandboxID)}, nil)
+	stdout, _, err := b.podman(ctx, []string{"inspect", "--type", "container", "--format", "{{.NetworkSettings.Gateway}}", b.containerName(sandboxID)}, nil)
 	if err != nil {
 		return "", err
 	}
@@ -1137,13 +1137,23 @@ type podmanInspect struct {
 }
 
 // Inspect implements Backend.Inspect.
-// Parses `podman inspect --format json <container>` to determine running state
-// and the current host-port mappings.
+// Parses `podman inspect --type container --format json <container>` to
+// determine running state and the current host-port mappings.
+//
+// `--type container` is load-bearing and every inspect on this backend carries
+// it.  Bare `podman inspect NAME` searches containers *and* images, which breaks
+// this method twice over on a sandbox that does not exist: podman reports
+// `no such object: "NAME"` — a phrase no classifier here matches, so the absence
+// never becomes ErrSandboxNotFound and the caller sees an opaque exit 125
+// forever — and if an image happens to answer to that name it succeeds instead,
+// returning image JSON whose State.Running is false, so a missing sandbox reads
+// as a stopped one. With the type pinned podman says `no such container NAME`,
+// which isNoSuchContainer does match, and nothing but a container can answer.
 func (b *PodmanBackend) Inspect(ctx context.Context, id string) (Status, error) {
 	if err := validID(id); err != nil {
 		return Status{}, err
 	}
-	stdout, _, err := b.podman(ctx, []string{"inspect", "--format", "json", b.containerName(id)}, nil)
+	stdout, _, err := b.podman(ctx, []string{"inspect", "--type", "container", "--format", "json", b.containerName(id)}, nil)
 	if err != nil {
 		// If the container doesn't exist, surface ErrSandboxNotFound.
 		if isNoSuchContainer(err) {
@@ -1236,7 +1246,7 @@ func (b *PodmanBackend) ContainerAddr(ctx context.Context, id string, port int) 
 	if err := validID(id); err != nil {
 		return "", err
 	}
-	stdout, _, err := b.podman(ctx, []string{"inspect", "--format", "{{.NetworkSettings.IPAddress}}", b.containerName(id)}, nil)
+	stdout, _, err := b.podman(ctx, []string{"inspect", "--type", "container", "--format", "{{.NetworkSettings.IPAddress}}", b.containerName(id)}, nil)
 	if err != nil {
 		if isNoSuchContainer(err) {
 			return "", fmt.Errorf("sandbox container addr %s: %w", id, ErrSandboxNotFound)

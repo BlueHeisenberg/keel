@@ -1730,6 +1730,61 @@ func TestRecreate_FailurePathsNeverDeleteVolume(t *testing.T) {
 	})
 }
 
+// podmanEmulator answers `inspect` the way podman 4.9.3 actually answers it,
+// observed on a real host:
+//
+//	$ podman inspect --format json nosuchctr
+//	[]
+//	Error: no such object: "nosuchctr"          (exit 125)
+//	$ podman inspect --type container --format json nosuchctr
+//	[]
+//	Error: no such container nosuchctr          (exit 125)
+//	$ podman inspect --format json alpine
+//	[ { "Id": ... } ]                            (exit 0 — that is the IMAGE)
+//
+// Bare `inspect` resolves containers *and* images, so it neither says anything
+// isNoSuchContainer recognises nor fails at all when an image answers to the
+// name.  Everything else falls through to an empty success.
+type podmanEmulator struct{ existingImages map[string]bool }
+
+func (p podmanEmulator) Run(_ context.Context, args []string, _ []byte, _ []string) ([]byte, []byte, error) {
+	if len(args) < 2 || args[1] != "inspect" {
+		return nil, nil, nil
+	}
+	typed := findArg(args, "--type") >= 0
+	name := args[len(args)-1]
+	exit := &exec.ExitError{ProcessState: &os.ProcessState{}}
+	switch {
+	case typed:
+		return []byte("[]\n"), []byte("Error: no such container " + name), exit
+	case p.existingImages[name]:
+		return []byte(`[{"Id":"deadbeef","State":{}}]`), nil, nil
+	default:
+		return []byte("[]\n"), []byte(`Error: no such object: "` + name + `"`), exit
+	}
+}
+
+// TestInspect_MissingSandboxAgainstRealPodmanBehaviour pins the one thing that
+// made isolated mode impossible to run: Inspect must report a sandbox that does
+// not exist as ErrSandboxNotFound when podman behaves as podman really behaves.
+// Drop `--type container` from Inspect's argv and both halves fail — the first
+// with an opaque exit 125 that no caller can turn into "create it", the second
+// by reporting a stopped sandbox that is really an image of the same name.
+func TestInspect_MissingSandboxAgainstRealPodmanBehaviour(t *testing.T) {
+	b := newPodmanBackendWithRunner(podmanEmulator{}, slog.Default())
+	if _, err := b.Inspect(context.Background(), "sb-gone"); !errors.Is(err, ErrSandboxNotFound) {
+		t.Fatalf("missing sandbox: want ErrSandboxNotFound, got %v", err)
+	}
+
+	// An image answering to the sandbox's container name must not be mistaken
+	// for the sandbox.
+	img := Config{}.withDefaults().NamePrefix + "sb-shadowed"
+	b = newPodmanBackendWithRunner(podmanEmulator{existingImages: map[string]bool{img: true}}, slog.Default())
+	if _, err := b.Inspect(context.Background(), "sb-shadowed"); !errors.Is(err, ErrSandboxNotFound) {
+		t.Fatalf("sandbox shadowed by an image of the same name: want ErrSandboxNotFound, got %v", err)
+	}
+}
+
 // TestInspect_NotFoundViaCommandErrorDetail does the same for the
 // ErrSandboxNotFound mapping in Inspect.
 func TestInspect_NotFoundViaCommandErrorDetail(t *testing.T) {
