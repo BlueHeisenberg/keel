@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -462,6 +463,73 @@ func TestChat_Success(t *testing.T) {
 	if want := `{"q":"x"}`; resp.ToolCalls[0].Function.Arguments != want {
 		t.Errorf("Arguments = %q, want %q (trailing brace repaired)",
 			resp.ToolCalls[0].Function.Arguments, want)
+	}
+}
+
+// recordingHandler is a slog.Handler that appends every record it receives.
+// Using a real Handler rather than parsing text/JSON output is what lets a
+// test tell "reached some logger" apart from "reached the exact handler that
+// was injected" -- which is the distinction that matters here, since a
+// consumer's structured logging (JSON, routed to a file, whatever) is a
+// Handler the consumer configured, not a format keel could match by accident.
+type recordingHandler struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func (h *recordingHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *recordingHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.records = append(h.records, r)
+	return nil
+}
+
+func (h *recordingHandler) WithAttrs(attrs []slog.Attr) slog.Handler { return h }
+func (h *recordingHandler) WithGroup(name string) slog.Handler       { return h }
+
+func (h *recordingHandler) find(msg string) (slog.Record, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, r := range h.records {
+		if r.Message == msg {
+			return r, true
+		}
+	}
+	return slog.Record{}, false
+}
+
+// TestChat_RepairedToolArgsReachInjectedLogger checks that the warning emitted
+// when a small model's malformed tool-call arguments are repaired lands on the
+// *injected* logger's handler, not on whatever slog.Default() happens to be at
+// the time. A consumer that configured JSON logging to a file must see this
+// line through that handler -- if it instead escapes to the package default,
+// it shows up as loose text on stderr instead of in the consumer's structured
+// log.
+func TestChat_RepairedToolArgsReachInjectedLogger(t *testing.T) {
+	const respBody = `{"choices":[{"message":{"content":"Hello","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"x\"}}"}}]},"finish_reason":"tool_calls"}]}`
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, respBody)
+	}))
+	defer srv.Close()
+
+	h := &recordingHandler{}
+	provider := llm.New(llm.Options{Logger: slog.New(h)})
+
+	ep := llm.Endpoint{BaseURL: srv.URL, Model: "m"}
+	if _, err := provider.Chat(context.Background(), ep, llm.ChatReq{}); err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+
+	rec, ok := h.find("llm: repaired malformed tool call arguments")
+	if !ok {
+		t.Fatal("repair warning did not reach the injected logger's handler")
+	}
+	if rec.Level != slog.LevelWarn {
+		t.Errorf("level = %v, want Warn", rec.Level)
 	}
 }
 
