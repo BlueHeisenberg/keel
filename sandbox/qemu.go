@@ -308,6 +308,39 @@ func (b *QemuBackend) cidFilePath(id string) string {
 	return filepath.Join(b.sandboxDir(id), "cid")
 }
 
+func (b *QemuBackend) createdAtFilePath(id string) string {
+	return filepath.Join(b.sandboxDir(id), "created_at")
+}
+
+// markCreatedNow persists the current time as this sandbox's CreatedAt,
+// overwriting any previous value. Called from Create and Recreate — the two
+// operations that make a new runtime instance — never from Start, which
+// restarts the existing one. Best-effort: a write failure only degrades
+// Status.CreatedAt to zero later, so it is logged rather than failing the
+// caller's operation.
+func (b *QemuBackend) markCreatedNow(id string) {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if err := os.WriteFile(b.createdAtFilePath(id), []byte(now), 0o644); err != nil {
+		b.log.Warn("qemu: failed to persist created_at file", "sandbox", id, "err", err)
+	}
+}
+
+// readCreatedAt returns the persisted CreatedAt for id, or the zero Time if
+// no marker file exists (sandboxes created before this field existed) or it
+// cannot be parsed.
+func (b *QemuBackend) readCreatedAt(id string) time.Time {
+	data, err := os.ReadFile(b.createdAtFilePath(id))
+	if err != nil {
+		return time.Time{}
+	}
+	t, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(string(data)))
+	if err != nil {
+		b.log.Warn("qemu: could not parse created_at file", "sandbox", id, "err", err)
+		return time.Time{}
+	}
+	return t
+}
+
 func (b *QemuBackend) overlayPath(id string) string {
 	return filepath.Join(b.sandboxDir(id), "overlay.qcow2")
 }
@@ -438,6 +471,7 @@ func (b *QemuBackend) Create(ctx context.Context, spec Spec) (Handle, error) {
 	b.log.Info("qemu: VM created", "sandbox", id, "cid", cid)
 
 	success = true
+	b.markCreatedNow(id)
 	return Handle{
 		ID:          id,
 		ContainerID: fmt.Sprintf("vsock-cid:%d", cid),
@@ -626,6 +660,7 @@ func (b *QemuBackend) Recreate(ctx context.Context, spec Spec) (Handle, error) {
 		return Handle{}, fmt.Errorf("qemu recreate %s: relaunch: %w", id, err)
 	}
 	b.log.Info("qemu: VM recreated (overlay preserved)", "sandbox", id)
+	b.markCreatedNow(id)
 	return b.refreshedHandle(id), nil
 }
 
@@ -852,6 +887,7 @@ func (b *QemuBackend) Inspect(ctx context.Context, id string) (Status, error) {
 	return Status{
 		Running:   running,
 		Endpoints: map[string]string{},
+		CreatedAt: b.readCreatedAt(id),
 	}, nil
 }
 

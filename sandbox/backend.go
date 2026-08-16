@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"time"
 )
 
 // SandboxLevel describes the isolation level of a sandbox.
@@ -250,6 +251,34 @@ type Status struct {
 	// The backend re-resolves host ports on every Inspect call because Podman
 	// can remap them on restart.
 	Endpoints map[string]string
+
+	// CreatedAt is when the sandbox's current runtime object was made. Zero
+	// when unknown.
+	//
+	// This is creation time, not start time, and the two diverge under this
+	// package's own operations: Start (a restart of the same object) does
+	// NOT change CreatedAt. Recreate DOES change it — Recreate replaces the
+	// runtime with a new instance (PodmanBackend creates a new container;
+	// QemuBackend rewrites its creation marker, see below), so CreatedAt
+	// advances even though the work volume/overlay, and the caller's data on
+	// it, survive untouched. A caller that provisions files at Create time
+	// and wants to know whether an already-running sandbox predates a file it
+	// now wants delivered should compare CreatedAt against that file's own
+	// timestamp — not merely branch on the file's existence, which cannot
+	// distinguish "provisioned before this sandbox was created" from
+	// "provisioned after".
+	//
+	// PodmanBackend: parsed verbatim from `podman inspect`'s "Created" field
+	// (RFC3339Nano with a numeric zone offset — measured against real podman
+	// 4.9.3, which does not change this field across stop/start). A parse
+	// failure leaves CreatedAt zero and logs a warning rather than failing
+	// Inspect.
+	//
+	// QemuBackend: a VM has no inspectable analogue to podman's Created, so
+	// the backend persists its own timestamp file at Create and Recreate.
+	// A sandbox created by a keel build before this field existed has no
+	// such file and reports zero.
+	CreatedAt time.Time
 }
 
 // Backend is the runtime-agnostic interface for sandbox lifecycle, execution,

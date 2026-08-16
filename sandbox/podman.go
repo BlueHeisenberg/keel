@@ -1142,7 +1142,12 @@ func (b *PodmanBackend) Restore(ctx context.Context, id string, ref SnapshotRef)
 // podmanInspect is the minimal subset of `podman inspect` JSON that we need.
 // The full output is much larger; we only decode what we use to avoid fragility.
 type podmanInspect struct {
-	State struct {
+	// Created is verbatim RFC3339Nano with a numeric zone offset, e.g.
+	// "2026-08-16T09:16:21.164392221+02:00" — measured against real podman
+	// 4.9.3 (`podman inspect --format json`). It does not change across
+	// stop/start; see Status.CreatedAt.
+	Created string `json:"Created"`
+	State   struct {
 		Running bool `json:"Running"`
 	} `json:"State"`
 	NetworkSettings struct {
@@ -1215,9 +1220,21 @@ func (b *PodmanBackend) Inspect(ctx context.Context, id string) (Status, error) 
 		endpoints[key] = fmt.Sprintf("http://%s:%s", host, hp)
 	}
 
+	var createdAt time.Time
+	if info.Created != "" {
+		var perr error
+		createdAt, perr = time.Parse(time.RFC3339Nano, info.Created)
+		if perr != nil {
+			b.log.Warn("sandbox: could not parse podman Created field",
+				"sandbox", id, "created", info.Created, "err", perr)
+			createdAt = time.Time{}
+		}
+	}
+
 	return Status{
 		Running:   info.State.Running,
 		Endpoints: endpoints,
+		CreatedAt: createdAt,
 	}, nil
 }
 

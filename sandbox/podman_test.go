@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 )
 
 // ---- mock runner -----------------------------------------------------------
@@ -605,6 +606,60 @@ func TestInspect_StoppedContainer(t *testing.T) {
 	}
 	if len(status.Endpoints) != 0 {
 		t.Errorf("Endpoints should be empty for stopped container with no ports; got %v", status.Endpoints)
+	}
+}
+
+// cannedInspectJSONWithCreated reproduces the "Created" field verbatim as
+// measured against real podman 4.9.3 (theharness-dev, `podman inspect --type
+// container --format json` on a freshly-run container):
+//
+//	"Created": "2026-08-16T09:16:21.164392221+02:00"
+//
+// RFC3339Nano with a numeric zone offset, sub-second precision trimmed of
+// trailing zeros. Confirmed against the same real host that this value does
+// not change across `podman stop`/`podman start` (only State.StartedAt does).
+const cannedInspectJSONWithCreated = `[
+  {
+    "Created": "2026-08-16T09:16:21.164392221+02:00",
+    "State": {
+      "Running": true
+    },
+    "NetworkSettings": {
+      "Ports": {}
+    }
+  }
+]`
+
+func TestInspect_CreatedAt_ParsesMeasuredPodmanFormat(t *testing.T) {
+	r := &mockRunner{}
+	b := newTestBackend(r)
+	r.responses = []mockResponse{{stdout: []byte(cannedInspectJSONWithCreated)}}
+
+	status, err := b.Inspect(context.Background(), "sb-created-1")
+	if err != nil {
+		t.Fatalf("Inspect: %v", err)
+	}
+	want, err := time.Parse(time.RFC3339Nano, "2026-08-16T09:16:21.164392221+02:00")
+	if err != nil {
+		t.Fatalf("test setup: parse want time: %v", err)
+	}
+	if !status.CreatedAt.Equal(want) {
+		t.Errorf("CreatedAt = %v, want %v", status.CreatedAt, want)
+	}
+}
+
+func TestInspect_CreatedAt_ParseFailure_LeavesZeroNotError(t *testing.T) {
+	r := &mockRunner{}
+	b := newTestBackend(r)
+	badJSON := `[{"Created":"not-a-timestamp","State":{"Running":true},"NetworkSettings":{"Ports":{}}}]`
+	r.responses = []mockResponse{{stdout: []byte(badJSON)}}
+
+	status, err := b.Inspect(context.Background(), "sb-created-2")
+	if err != nil {
+		t.Fatalf("Inspect should tolerate an unparseable Created field, got error: %v", err)
+	}
+	if !status.CreatedAt.IsZero() {
+		t.Errorf("CreatedAt = %v, want zero value for unparseable input", status.CreatedAt)
 	}
 }
 

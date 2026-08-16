@@ -945,6 +945,86 @@ func TestQemuCreate_CommandAndFilesUnsupported(t *testing.T) {
 // TestQemuRecreate_PreservesOverlay verifies the VM process is replaced while
 // the overlay disk — the sandbox's data — survives untouched: no qemu-img call,
 // no state removal, and the relaunch boots the SAME overlay.
+// TestQemuCreatedAt_SetOnCreate_StableAcrossStart_AdvancesOnRecreate pins the
+// contract documented on Status.CreatedAt for QemuBackend: Create sets it,
+// a plain restart (Start) leaves it unchanged, and Recreate — which replaces
+// the runtime with a new instance, exactly like PodmanBackend creating a new
+// container — advances it. QEMU has no inspectable "Created" property of its
+// own (unlike podman), so this also exercises the persisted marker file
+// (markCreatedNow/readCreatedAt) that stands in for one.
+func TestQemuCreatedAt_SetOnCreate_StableAcrossStart_AdvancesOnRecreate(t *testing.T) {
+	r := &mockRunner{}
+	b := newQemuTestBackend(t, r)
+
+	id := "vm-created"
+	r.responses = []mockResponse{ok(""), ok("")} // qemu-img create, launch
+	if _, err := b.Create(context.Background(), Spec{Name: id, NetworkPolicy: NetworkPolicyOpen}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	// The mock runner never actually writes overlay.qcow2 to disk; Start and
+	// Recreate both require it to exist (they check os.Stat), so stand in for
+	// what real qemu-img create would have produced.
+	if err := os.WriteFile(b.overlayPath(id), []byte("qcow2"), 0o644); err != nil {
+		t.Fatalf("write overlay: %v", err)
+	}
+
+	st1, err := b.Inspect(context.Background(), id)
+	if err != nil {
+		t.Fatalf("Inspect after Create: %v", err)
+	}
+	if st1.CreatedAt.IsZero() {
+		t.Fatal("CreatedAt is zero after Create")
+	}
+
+	time.Sleep(2 * time.Millisecond) // force a distinguishable timestamp below
+
+	r.responses = []mockResponse{ok("")} // Start relaunch
+	if err := b.Start(context.Background(), id); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	st2, err := b.Inspect(context.Background(), id)
+	if err != nil {
+		t.Fatalf("Inspect after Start: %v", err)
+	}
+	if !st2.CreatedAt.Equal(st1.CreatedAt) {
+		t.Errorf("Start (restart) changed CreatedAt: before=%v after=%v", st1.CreatedAt, st2.CreatedAt)
+	}
+
+	time.Sleep(2 * time.Millisecond)
+
+	r.responses = []mockResponse{ok("")} // Recreate relaunch
+	if _, err := b.Recreate(context.Background(), Spec{Name: id, NetworkPolicy: NetworkPolicyOpen}); err != nil {
+		t.Fatalf("Recreate: %v", err)
+	}
+	st3, err := b.Inspect(context.Background(), id)
+	if err != nil {
+		t.Fatalf("Inspect after Recreate: %v", err)
+	}
+	if !st3.CreatedAt.After(st1.CreatedAt) {
+		t.Errorf("Recreate did not advance CreatedAt: before=%v after=%v", st1.CreatedAt, st3.CreatedAt)
+	}
+}
+
+// TestQemuCreatedAt_MissingMarkerFile_IsZero verifies a sandbox with no
+// created_at file — one created by a keel build before this field existed —
+// reports the zero value rather than an error.
+func TestQemuCreatedAt_MissingMarkerFile_IsZero(t *testing.T) {
+	r := &mockRunner{}
+	b := newQemuTestBackend(t, r)
+	id := "vm-legacy"
+	if err := os.MkdirAll(b.sandboxDir(id), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	status, err := b.Inspect(context.Background(), id)
+	if err != nil {
+		t.Fatalf("Inspect: %v", err)
+	}
+	if !status.CreatedAt.IsZero() {
+		t.Errorf("CreatedAt = %v, want zero for a sandbox with no created_at marker", status.CreatedAt)
+	}
+}
+
 func TestQemuRecreate_PreservesOverlay(t *testing.T) {
 	r := &mockRunner{}
 	b := newQemuTestBackend(t, r)
