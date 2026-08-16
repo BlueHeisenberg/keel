@@ -642,24 +642,41 @@ func buildEgressRuleset(table string, policy NetworkPolicy, hostGW string, allow
 }
 
 // Start implements Backend.Start.
+// A missing container is reported as ErrSandboxNotFound, matching Inspect and
+// ContainerAddr: podman's message for a missing name on `start` is
+// `Error: no container with name or ID "…" found: no such container`, which
+// isNoSuchContainer already recognises (verified against real podman 4.9.3).
 func (b *PodmanBackend) Start(ctx context.Context, id string) error {
 	if err := validID(id); err != nil {
 		return err
 	}
 	_, _, err := b.podman(ctx, []string{"start", b.containerName(id)}, nil)
 	if err != nil {
+		if isNoSuchContainer(err) {
+			return fmt.Errorf("sandbox start %s: %w", id, ErrSandboxNotFound)
+		}
 		return fmt.Errorf("sandbox start %s: %w", id, err)
 	}
 	return nil
 }
 
 // Stop implements Backend.Stop.
+// A missing container is reported as ErrSandboxNotFound, matching Inspect and
+// ContainerAddr (see Start).  Note this is a real error, not tolerated as a
+// no-op: unlike removeContainer/Purge, whose goal state is "gone" and so treat
+// an absent container as success, Stop is asked to act on a specific sandbox
+// the caller believes exists, and the caller (kenward's rollOne and shutdown,
+// among others) branches on ErrSandboxNotFound to tell that apart from a real
+// stop failure.
 func (b *PodmanBackend) Stop(ctx context.Context, id string) error {
 	if err := validID(id); err != nil {
 		return err
 	}
 	_, _, err := b.podman(ctx, []string{"stop", b.containerName(id)}, nil)
 	if err != nil {
+		if isNoSuchContainer(err) {
+			return fmt.Errorf("sandbox stop %s: %w", id, ErrSandboxNotFound)
+		}
 		return fmt.Errorf("sandbox stop %s: %w", id, err)
 	}
 	return nil

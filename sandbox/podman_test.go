@@ -1730,8 +1730,9 @@ func TestRecreate_FailurePathsNeverDeleteVolume(t *testing.T) {
 	})
 }
 
-// podmanEmulator answers `inspect` the way podman 4.9.3 actually answers it,
-// observed on a real host:
+// podmanEmulator answers `inspect`, `start`, and `stop` the way podman 4.9.3
+// actually answers them, observed on a real host (theharness-dev, podman
+// 4.9.3, missing name "sbx-does-not-exist-xyz"):
 //
 //	$ podman inspect --format json nosuchctr
 //	[]
@@ -1741,6 +1742,10 @@ func TestRecreate_FailurePathsNeverDeleteVolume(t *testing.T) {
 //	Error: no such container nosuchctr          (exit 125)
 //	$ podman inspect --format json alpine
 //	[ { "Id": ... } ]                            (exit 0 — that is the IMAGE)
+//	$ podman start nosuchctr
+//	Error: no container with name or ID "nosuchctr" found: no such container  (exit 125)
+//	$ podman stop nosuchctr
+//	Error: no container with name or ID "nosuchctr" found: no such container  (exit 125)
 //
 // Bare `inspect` resolves containers *and* images, so it neither says anything
 // isNoSuchContainer recognises nor fails at all when an image answers to the
@@ -1748,19 +1753,26 @@ func TestRecreate_FailurePathsNeverDeleteVolume(t *testing.T) {
 type podmanEmulator struct{ existingImages map[string]bool }
 
 func (p podmanEmulator) Run(_ context.Context, args []string, _ []byte, _ []string) ([]byte, []byte, error) {
-	if len(args) < 2 || args[1] != "inspect" {
+	if len(args) < 2 {
 		return nil, nil, nil
 	}
-	typed := findArg(args, "--type") >= 0
-	name := args[len(args)-1]
 	exit := &exec.ExitError{ProcessState: &os.ProcessState{}}
-	switch {
-	case typed:
-		return []byte("[]\n"), []byte("Error: no such container " + name), exit
-	case p.existingImages[name]:
-		return []byte(`[{"Id":"deadbeef","State":{}}]`), nil, nil
+	name := args[len(args)-1]
+	switch args[1] {
+	case "inspect":
+		typed := findArg(args, "--type") >= 0
+		switch {
+		case typed:
+			return []byte("[]\n"), []byte("Error: no such container " + name), exit
+		case p.existingImages[name]:
+			return []byte(`[{"Id":"deadbeef","State":{}}]`), nil, nil
+		default:
+			return []byte("[]\n"), []byte(`Error: no such object: "` + name + `"`), exit
+		}
+	case "start", "stop":
+		return nil, []byte(`Error: no container with name or ID "` + name + `" found: no such container`), exit
 	default:
-		return []byte("[]\n"), []byte(`Error: no such object: "` + name + `"`), exit
+		return nil, nil, nil
 	}
 }
 
@@ -1797,4 +1809,45 @@ func TestInspect_NotFoundViaCommandErrorDetail(t *testing.T) {
 	if !errors.Is(err, ErrSandboxNotFound) {
 		t.Errorf("expected ErrSandboxNotFound via CommandError detail, got %v", err)
 	}
+}
+
+// TestStopStart_MissingSandboxAgainstRealPodmanBehaviour pins the gap found
+// while verifying the Inspect fix (v0.5.1): podman's message for `start`/`stop`
+// on a missing name — `Error: no container with name or ID "…" found: no such
+// container` (exit 125) — already matches isNoSuchContainer, but Stop and
+// Start never called it and so never produced ErrSandboxNotFound.  kenward's
+// rollOne and shutdown both branch on ErrSandboxNotFound from these two calls;
+// before this fix those branches were dead.
+func TestStopStart_MissingSandboxAgainstRealPodmanBehaviour(t *testing.T) {
+	b := newPodmanBackendWithRunner(podmanEmulator{}, slog.Default())
+
+	if err := b.Start(context.Background(), "sb-gone"); !errors.Is(err, ErrSandboxNotFound) {
+		t.Errorf("Start on missing sandbox: want ErrSandboxNotFound, got %v", err)
+	}
+	if err := b.Stop(context.Background(), "sb-gone"); !errors.Is(err, ErrSandboxNotFound) {
+		t.Errorf("Stop on missing sandbox: want ErrSandboxNotFound, got %v", err)
+	}
+}
+
+// TestStopStart_NotFoundViaCommandErrorDetail does the same via the
+// CommandError.Detail path (stderr carried out-of-band, as errText reads it),
+// matching TestInspect_NotFoundViaCommandErrorDetail.
+func TestStopStart_NotFoundViaCommandErrorDetail(t *testing.T) {
+	notFoundMsg := []byte(`Error: no container with name or ID "sbx-sb-gone" found: no such container`)
+	exit := &exec.ExitError{ProcessState: &os.ProcessState{}}
+
+	t.Run("start", func(t *testing.T) {
+		r := &mockRunner{responses: []mockResponse{{stderr: notFoundMsg, err: exit}}}
+		b := newTestBackend(r)
+		if err := b.Start(context.Background(), "sb-gone"); !errors.Is(err, ErrSandboxNotFound) {
+			t.Errorf("expected ErrSandboxNotFound, got %v", err)
+		}
+	})
+	t.Run("stop", func(t *testing.T) {
+		r := &mockRunner{responses: []mockResponse{{stderr: notFoundMsg, err: exit}}}
+		b := newTestBackend(r)
+		if err := b.Stop(context.Background(), "sb-gone"); !errors.Is(err, ErrSandboxNotFound) {
+			t.Errorf("expected ErrSandboxNotFound, got %v", err)
+		}
+	})
 }
