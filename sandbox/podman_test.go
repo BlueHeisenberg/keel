@@ -1632,6 +1632,68 @@ func TestPurge_NotFoundViaCommandErrorDetail(t *testing.T) {
 
 // ---- Recreate tests ------------------------------------------------------------
 
+// TestContainerRemovalReapsAnonymousVolumes pins both halves of the anonymous
+// volume fix at the argv level, for every path that removes a container.
+//
+// The leak: an image with a `VOLUME` instruction gives every container an
+// anonymous volume, and `podman rm` without `--volumes` strands it.  Nothing
+// collects those, so a consumer that rolls containers accumulates one per
+// recreate forever — 186 of them in one observed session.
+//
+// The regression the flag must NOT cause: `--volumes` removes anonymous
+// volumes only, so the named work volume has to survive.  That is checked here
+// as "no removal path ever names the work volume to podman", and against real
+// podman in TestPodmanAnonymousVolumeLifecycle (build tag e2e), which is where
+// the claim about podman's behaviour is actually measured.
+func TestContainerRemovalReapsAnonymousVolumes(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(b *PodmanBackend) error
+	}{
+		{"recreate", func(b *PodmanBackend) error {
+			_, err := b.Recreate(context.Background(), Spec{
+				Name: "sb-anon", Image: "img:v2",
+				Profile: ProfileHeadless, NetworkPolicy: NetworkPolicyOpen,
+			})
+			return err
+		}},
+		{"purge", func(b *PodmanBackend) error {
+			return b.Purge(context.Background(), "sb-anon")
+		}},
+		{"restore", func(b *PodmanBackend) error {
+			_, err := b.Restore(context.Background(), "sb-anon", SnapshotRef{Ref: "snap:1"})
+			return err
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &mockRunner{}
+			b := newTestBackend(r)
+			if err := tc.run(b); err != nil {
+				t.Fatalf("%s: %v", tc.name, err)
+			}
+
+			workVol := b.volumeName("sb-anon")
+			sawContainerRM := false
+			for _, c := range r.calls {
+				if len(c.args) < 2 || c.args[1] != "rm" {
+					continue
+				}
+				sawContainerRM = true
+				if !containsArg(c.args, "--volumes") {
+					t.Errorf("container rm without --volumes strands an anonymous "+
+						"volume on every removal: %s", argString(c.args))
+				}
+				if containsArg(c.args, workVol) {
+					t.Errorf("container rm must not name the work volume: %s", argString(c.args))
+				}
+			}
+			if !sawContainerRM {
+				t.Fatalf("%s issued no container rm at all: %v", tc.name, callArgvs(r.calls))
+			}
+		})
+	}
+}
+
 // sawVolumeCommand reports whether any recorded call was a `podman volume ...`
 // subcommand (create, rm, anything).  Recreate must never produce one.
 func sawVolumeCommand(calls []call) bool {
@@ -1645,7 +1707,7 @@ func sawVolumeCommand(calls []call) bool {
 
 // TestRecreate_PreservesVolume verifies the rolling-update mechanism: the old
 // container is removed, a new one is created from the NEW image, the same
-// named work volume is reattached — and no volume command of any kind runs, so
+// named work volume is reattached — and no `podman volume` command runs, so
 // the caller's data cannot be deleted by the operation.
 func TestRecreate_PreservesVolume(t *testing.T) {
 	r := &mockRunner{}

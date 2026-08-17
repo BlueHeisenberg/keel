@@ -143,6 +143,28 @@ var measuredToolOutput = []toolSample{
 		Stderr: ``,
 	},
 
+	// ── podman: `rm --volumes` says nothing new ──────────────────────────────
+	//
+	// Every container rm in podman.go carries `--volumes`, so that the
+	// anonymous volume an image's `VOLUME` instruction gives each container is
+	// reaped with it instead of stranded.  Recorded here so the next reader can
+	// see that the flag changes what podman DOES and not what it SAYS: the
+	// forced form still exits 0 in silence on an absent container, the
+	// non-forced form still produces the exact "no such container" wording of
+	// the plain `podman rm` sample above, and every classifier's verdict is
+	// unchanged.  Nothing on this path needed a new match, which is why none
+	// was added.
+	{
+		Tool: "podman 4.9.3", Cmd: `podman rm --force --volumes keel-missing`, Exit: 0,
+		Stderr: ``,
+	},
+	{
+		Tool: "podman 4.9.3", Cmd: `podman rm --volumes keel-missing`, Exit: 1,
+		Stderr:          `Error: no container with ID or name "keel-missing" found: no such container`,
+		NotFound:        true,
+		NoSuchContainer: true,
+	},
+
 	// ── podman: the image is missing ─────────────────────────────────────────
 	//
 	// Every missing-image path answers with "image not known".  "no such image"
