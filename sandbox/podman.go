@@ -259,8 +259,8 @@ func (b *PodmanBackend) Create(ctx context.Context, spec Spec) (Handle, error) {
 	// not create, and that is what cleanup below turns on: Create made the
 	// volume → Purge, so a spec that cannot launch does not leak a
 	// container-less volume; the volume predates the call → removeContainer,
-	// which by construction issues no volume command at all, so a failed
-	// restart cannot destroy the data the restart existed to preserve.
+	// which never removes a named volume, so a failed restart cannot destroy
+	// the data the restart existed to preserve.
 	//
 	// The "already exists" case is recognised WITHOUT reading podman's wording.
 	// `podman volume exists` answers by exit status alone, so the tolerated
@@ -300,8 +300,10 @@ func (b *PodmanBackend) volumeExists(ctx context.Context, vol string) bool {
 // Recreate implements Backend.Recreate: the container is replaced from spec —
 // a new image included — while the named work volume, and the caller's data on
 // it, survive.  The volume-deleting code (Purge) is not reachable from here:
-// no volume command runs on this path, and every failure cleanup is
-// removeContainer, which cannot touch a volume by construction.
+// nothing on this path names a volume to delete, and every failure cleanup is
+// removeContainer, whose only volume effect is `podman rm --volumes`, which
+// reaps the outgoing container's anonymous volumes and leaves named ones
+// standing.
 func (b *PodmanBackend) Recreate(ctx context.Context, spec Spec) (Handle, error) {
 	if err := validSpec(spec); err != nil {
 		return Handle{}, err
@@ -733,11 +735,27 @@ func (b *PodmanBackend) Stop(ctx context.Context, id string) error {
 	return nil
 }
 
-// removeContainer stops and removes the container for id and touches nothing
-// else: it issues no volume command of any kind, so the sandbox's work volume
-// — the caller's data — survives it by construction.  It is the teardown used
-// by Recreate and by every failure path reachable from Recreate.  A missing or
-// already-stopped container is tolerated.
+// removeContainer stops and removes the container for id, together with the
+// anonymous volumes that container owns.  The sandbox's named work volume —
+// the caller's data — survives it.  It is the teardown used by Recreate and by
+// every failure path reachable from Recreate.  A missing or already-stopped
+// container is tolerated.
+//
+// `--volumes` is load-bearing in both directions and is measured, not assumed
+// (podman 4.9.3):
+//
+//   - Without it, every container built from an image carrying a `VOLUME`
+//     instruction strands an empty anonymous volume on removal.  Nothing ever
+//     collects those, so a consumer that recreates containers on a rolling
+//     basis accumulates them until the disk fills.  One real session left 186.
+//   - With it, podman removes ONLY the anonymous volumes attached to this
+//     container.  A named volume is untouched whether it is mounted at a path
+//     the image declares as a VOLUME or anywhere else, so `--volume
+//     <name>:/work` still outlives the container it was mounted into — which is
+//     the property Recreate exists to provide.
+//
+// Both facts are pinned by TestPodmanAnonymousVolumeLifecycle (build tag e2e),
+// which runs them against real podman rather than against this comment.
 func (b *PodmanBackend) removeContainer(ctx context.Context, id string) error {
 	if err := validID(id); err != nil {
 		return err
@@ -749,8 +767,9 @@ func (b *PodmanBackend) removeContainer(ctx context.Context, id string) error {
 		b.log.Debug("sandbox remove-container: stop error (may be already stopped)", "id", id, "err", err)
 	}
 
-	// Remove container.  Tolerate a missing container ("no such container").
-	if _, _, err := b.podman(ctx, []string{"rm", "--force", cname}, nil); err != nil {
+	// Remove container and its anonymous volumes.  Tolerate a missing
+	// container ("no such container").
+	if _, _, err := b.podman(ctx, []string{"rm", "--force", "--volumes", cname}, nil); err != nil {
 		if isNotFoundErr(err) {
 			b.log.Debug("sandbox remove-container: container not found", "id", id, "err", err)
 		} else {
@@ -763,7 +782,8 @@ func (b *PodmanBackend) removeContainer(ctx context.Context, id string) error {
 // Purge implements Backend.Purge (named Destroy before v0.5.0).
 // Stops the container (tolerates already-stopped), removes it, then removes
 // the named work volume — the caller's data.  This is the only method on the
-// backend that deletes the volume.
+// backend that deletes the named work volume; removeContainer reaps anonymous
+// volumes but never that one.
 func (b *PodmanBackend) Purge(ctx context.Context, id string) error {
 	if err := b.removeContainer(ctx, id); err != nil {
 		return fmt.Errorf("sandbox purge: %w", err)
@@ -1174,7 +1194,10 @@ func (b *PodmanBackend) Restore(ctx context.Context, id string, ref SnapshotRef)
 	if _, _, err := b.podman(ctx, []string{"stop", cname}, nil); err != nil {
 		b.log.Debug("sandbox restore: stop error (may be already stopped)", "id", id)
 	}
-	if _, _, err := b.podman(ctx, []string{"rm", "--force", cname}, nil); err != nil {
+	// `--volumes` for the same reason removeContainer carries it: the outgoing
+	// container's anonymous volumes would otherwise be stranded, and vol below
+	// is named, so it survives.
+	if _, _, err := b.podman(ctx, []string{"rm", "--force", "--volumes", cname}, nil); err != nil {
 		return Handle{}, fmt.Errorf("sandbox restore rm %s: %w", id, err)
 	}
 
