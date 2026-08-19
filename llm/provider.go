@@ -809,6 +809,13 @@ func (p *httpProvider) normalizeToolCalls(ctx context.Context, calls []ToolCall)
 
 // logFixup reports an argument repair or drop. A clean or empty argument string
 // is unremarkable and stays quiet.
+//
+// Only the two outcomes that lost something warn. [ArgReformatted] is a healthy
+// call whose arguments happened to re-encode to different bytes, which for a model
+// that puts a space after its colons is every call it ever makes; warning on it
+// warned on 100% of a real run's successes and taught its operator to skim past
+// the one line that would have said an argument had been thrown away. It is logged
+// at debug, where somebody diffing a wire capture can still find it.
 func (p *httpProvider) logFixup(ctx context.Context, tool, raw string, fixup ArgFixup) {
 	switch fixup {
 	case ArgRepaired:
@@ -816,6 +823,9 @@ func (p *httpProvider) logFixup(ctx context.Context, tool, raw string, fixup Arg
 			"tool", tool, "raw_len", len(raw))
 	case ArgDropped:
 		p.logger.WarnContext(ctx, "llm: dropped unparseable tool call arguments, defaulted to {}",
+			"tool", tool, "raw_len", len(raw))
+	case ArgReformatted:
+		p.logger.DebugContext(ctx, "llm: re-encoded well-formed tool call arguments to canonical JSON",
 			"tool", tool, "raw_len", len(raw))
 	}
 }

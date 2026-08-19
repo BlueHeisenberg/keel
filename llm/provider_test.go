@@ -533,6 +533,60 @@ func TestChat_RepairedToolArgsReachInjectedLogger(t *testing.T) {
 	}
 }
 
+// TestChat_WellFormedToolArgsDoNotWarn is the other half of the test above, and
+// the one a live run needed. A model that puts a space after its colons emits
+// arguments that re-encode to different bytes on every single call; while that
+// classified as ArgRepaired, the warning above fired on 19 healthy calls out of
+// 19 and on every call in the end-to-end suite. Nothing was malformed. An
+// operator who reads "repaired malformed tool call arguments" on every success
+// learns to skim it, and the line they skim is the same line a real ArgDropped
+// would have arrived on.
+//
+// So: no warning at any level for a well-formed call, and the re-encoding is
+// still recorded at debug for anybody diffing a wire capture.
+func TestChat_WellFormedToolArgsDoNotWarn(t *testing.T) {
+	// `{"q": "x"}` -- valid, complete, and one space away from canonical.
+	const respBody = `{"choices":[{"message":{"content":"Hello","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"q\": \"x\"}"}}]},"finish_reason":"tool_calls"}]}`
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, respBody)
+	}))
+	defer srv.Close()
+
+	h := &recordingHandler{}
+	provider := llm.New(llm.Options{Logger: slog.New(h)})
+
+	ep := llm.Endpoint{BaseURL: srv.URL, Model: "m"}
+	resp, err := provider.Chat(context.Background(), ep, llm.ChatReq{})
+	if err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+	if want := `{"q":"x"}`; resp.ToolCalls[0].Function.Arguments != want {
+		t.Fatalf("Arguments = %q, want %q", resp.ToolCalls[0].Function.Arguments, want)
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, r := range h.records {
+		if r.Level >= slog.LevelWarn {
+			t.Errorf("a well-formed tool call logged %v: %q", r.Level, r.Message)
+		}
+	}
+	var sawDebug bool
+	for _, r := range h.records {
+		if r.Message == "llm: re-encoded well-formed tool call arguments to canonical JSON" {
+			sawDebug = true
+			if r.Level != slog.LevelDebug {
+				t.Errorf("re-encode note level = %v, want Debug", r.Level)
+			}
+		}
+	}
+	if !sawDebug {
+		t.Error("the re-encoding was not recorded at debug; it has to stay findable for anybody diffing a wire capture")
+	}
+}
+
 // TestChat_EmptyResponse checks that a 2xx carrying nothing usable is reported
 // as a failure rather than as a completion that happened to be silent. A caller
 // that took it for success would credit a broken endpoint with an answer and
